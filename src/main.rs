@@ -1,7 +1,10 @@
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 use rand::Rng;
-use std::fs;
+use std::{
+    fs,
+    net::{IpAddr, SocketAddr},
+};
 use url::Url;
 
 use bendy::{decoding::FromBencode, encoding::Error};
@@ -13,20 +16,6 @@ pub struct Request {
     uploaded: u64,
     downloaded: u64,
     compact: bool,
-}
-
-fn encode(arr: &[u8]) -> String {
-    arr.iter()
-        .map(|&b| {
-            match b {
-                // hexadecimal number
-                0x30..=0x39 | 0x41..=0x59 | 0x61..=0x79 => {
-                    char::from_u32(b.into()).unwrap().to_string()
-                }
-                x => format!("%{:02x}", x).to_uppercase(),
-            }
-        })
-        .collect()
 }
 
 #[tokio::main]
@@ -61,8 +50,11 @@ async fn main() -> Result<(), Error> {
     let url = metadata.announce + "?" + &options;
     dbg!(&url);
     let resp = reqwest::get(url).await.unwrap();
+    let bytes = resp.bytes().await.unwrap();
+    dbg!(&bytes);
 
-    dbg!(resp.text().await.unwrap());
+    let resp = Response::from_bencode(&bytes).unwrap();
+    dbg!(resp);
 
     Ok(())
 }
@@ -89,6 +81,24 @@ struct Metadata {
     created: Option<u64>,
     comment: String,
     author: Option<String>,
+}
+
+#[derive(Default, Debug, Eq, PartialEq)]
+struct Peer {
+    id: String,
+    ip: String,
+}
+
+#[derive(Default, Debug, Eq, PartialEq)]
+struct Response {
+    failure_reason: Option<String>,
+    warning: Option<String>,
+    interval: u64,
+    min_interval: u64,
+    tracker_id: String,
+    complete: u64,
+    incomplete: u64,
+    peers: Vec<Peer>,
 }
 
 impl FromBencode for Metadata {
@@ -160,6 +170,86 @@ impl FromBencode for Metadata {
     }
 }
 
-struct Node {
-    url: Url,
+impl FromBencode for Response {
+    const EXPECTED_RECURSION_DEPTH: usize = 5;
+
+    fn decode_bencode_object(
+        object: bendy::decoding::Object,
+    ) -> Result<Self, bendy::decoding::Error>
+    where
+        Self: Sized,
+    {
+        let mut dict = object.try_into_dictionary()?;
+        let mut resp = Response::default();
+
+        while let Some(pair) = dict.next_pair()? {
+            match pair {
+                (b"failure reason", _) => {
+                    let s = String::decode_bencode_object(pair.1).unwrap();
+                    resp.failure_reason = Some(s);
+                }
+                (b"warning message", _) => {
+                    let s = String::decode_bencode_object(pair.1).unwrap();
+                    resp.warning = Some(s);
+                }
+                (b"interval", _) => {
+                    let i = u64::decode_bencode_object(pair.1).unwrap();
+                    resp.interval = i;
+                }
+                (b"min interval", _) => {
+                    let i = u64::decode_bencode_object(pair.1).unwrap();
+                    resp.min_interval = i;
+                }
+                (b"peers", _) => {
+                    let mut peers = pair.1.try_into_list().unwrap();
+
+                    while let Some(dict) = peers.next_object()? {
+                        let mut dict = dict.try_into_dictionary().unwrap();
+                        let mut peer = Peer::default();
+
+                        while let Some(pair) = dict.next_pair()? {
+                            match pair {
+                                (b"peer id", _) => {
+                                    let id = pair.1.try_into_bytes().unwrap();
+                                    peer.id = encode(id);
+                                }
+                                (b"ip", _) => {
+                                    let ip = String::decode_bencode_object(pair.1).unwrap();
+                                    peer.ip = ip;
+                                }
+                                (b"port", _) => {
+                                    let i = u64::decode_bencode_object(pair.1).unwrap();
+                                    resp.min_interval = i;
+                                }
+                                _ => {
+                                    let s = String::decode_bencode_object(pair.1).unwrap();
+                                }
+                            }
+                        }
+
+                        resp.peers.push(peer);
+                    }
+                }
+
+                _ => {
+                    let s = String::decode_bencode_object(pair.1).unwrap();
+                }
+            }
+        }
+        Ok(resp)
+    }
+}
+
+fn encode(arr: &[u8]) -> String {
+    arr.iter()
+        .map(|&b| {
+            match b {
+                // hexadecimal number
+                0x30..=0x39 | 0x41..=0x59 | 0x61..=0x79 => {
+                    char::from_u32(b.into()).unwrap().to_string()
+                }
+                x => format!("%{:02x}", x).to_uppercase(),
+            }
+        })
+        .collect()
 }
