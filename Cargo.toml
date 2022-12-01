@@ -1,0 +1,15 @@
+[package]
+name = "everlasting"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bendy = "0.3.3"
+rand = "0.8.5"
+reqwest = "0.11.13"
+rust-crypto = "0.2.36"
+tokio = { version = "1.22.0", features = ["full"] }
+url = "2.3.1"
+urlencoding = "2.1.2"
