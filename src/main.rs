@@ -68,10 +68,13 @@ async fn main() -> Result<(), Error> {
     let resp = Response::from_bencode(&bytes).unwrap();
     dbg!(&resp);
 
-    let scraper = Scraper(metadata.announce);
+    let scraper =
+        Scraper(metadata.announce.clone() + "?" + "info_hash=" + &encode(&metadata.info.value));
     let ok = scraper.get().unwrap();
-    let resp = reqwest::get(ok).await.unwrap();
-    dbg!("resp: ".to_owned() + &resp.text().await.unwrap());
+    let resp = client.get(ok).send().await.unwrap();
+
+    let bytes = resp.bytes().await.unwrap();
+    let resp = ScrapeResponse::from_bencode(&bytes).unwrap();
 
     Ok(())
 }

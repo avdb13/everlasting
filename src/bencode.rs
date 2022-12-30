@@ -2,12 +2,12 @@ use hex::FromHex;
 use std::convert::TryFrom;
 
 use bendy::decoding::{Decoder, DictDecoder, FromBencode, Object};
-use bendy::encoding::ToBencode;
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 
-use crate::data::{File, Info, Metadata, Mode, MultiInfo, Peer, Response, SingleInfo};
-use crate::helpers::encode;
+use crate::data::{
+    File, Info, Metadata, Mode, MultiInfo, Peer, Response, ScrapeResponse, SingleInfo, Status,
+};
 
 impl FromBencode for Response {
     const EXPECTED_RECURSION_DEPTH: usize = 5;
@@ -44,37 +44,41 @@ impl FromBencode for Response {
                 (b"peers", _) => {
                     let mut peers = Vec::new();
 
-                    let bytes = pair.1.try_into_bytes()?;
-                    let mut decoder = Decoder::new(bytes);
-
-                    if let Some(dict) = decoder.next_object()? {
-                        if let Ok(mut dict) = dict.try_into_dictionary() {
-                            while let Some(pair) = dict.next_pair()? {
-                                let mut peer = Peer::new();
-                                match pair {
-                                    (b"peer id", _) => {
-                                        peer.id = String::decode_bencode_object(pair.1)?;
-                                    }
-                                    (b"id", _) => {
-                                        peer.ip = String::decode_bencode_object(pair.1)?;
-                                    }
-                                    (b"port", _) => {
-                                        peer.port = u32::decode_bencode_object(pair.1)?;
-                                    }
-                                    _ => {}
+                    if let Object::Dict(mut dict) = pair.1 {
+                        while let Some(pair) = dict.next_pair()? {
+                            let mut peer = Peer::new();
+                            match pair {
+                                (b"peer id", _) => {
+                                    peer.id = String::decode_bencode_object(pair.1)?;
                                 }
-                                peers.push(peer);
+                                (b"id", _) => {
+                                    peer.ip = String::decode_bencode_object(pair.1)?;
+                                }
+                                (b"port", _) => {
+                                    peer.port = u32::decode_bencode_object(pair.1)?.to_string();
+                                }
+                                _ => {}
                             }
-                        } else {
-                            let mut decoder = Decoder::new(bytes);
-                            let clone = decoder.next_object()?.unwrap();
-
-                            dbg!(std::str::from_utf8(bytes).unwrap());
-
-                            let s = String::decode_bencode_object(clone)?;
-                        };
-                    }
-
+                            peers.push(peer);
+                        }
+                    } else if let Object::Bytes(bytes) = pair.1 {
+                        peers = bytes
+                            .windows(6)
+                            .map(|s| Peer {
+                                id: "".to_string(),
+                                ip: s[0..=4]
+                                    .iter()
+                                    .map(|x| x.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                                port: s[4..]
+                                    .iter()
+                                    .map(|x| x.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(""),
+                            })
+                            .collect::<Vec<Peer>>();
+                    };
                     resp.peers = peers;
                 }
                 _ => {}
@@ -303,5 +307,49 @@ impl FromBencode for Metadata {
             }
         }
         Ok(md)
+    }
+}
+
+impl FromBencode for ScrapeResponse {
+    const EXPECTED_RECURSION_DEPTH: usize = 5;
+
+    fn decode_bencode_object(
+        object: bendy::decoding::Object,
+    ) -> Result<Self, bendy::decoding::Error>
+    where
+        Self: Sized,
+    {
+        // &bytes = b"d5:filesd20:\x1b\x84\xcb\xd2TZf\x8a\xd85\x04!\xd4\x1b\x88\x0f?d\xcc\xf4d8:completei17e10:incompletei2e10:downloadedi1539eeee"
+
+        let mut dict = object.try_into_dictionary()?;
+        let mut result = Vec::new();
+
+        while let Some(files) = dict.next_pair()? {
+            let mut files = files.1.try_into_dictionary()?;
+
+            while let Some(file) = files.next_pair()? {
+                let mut decoder = file.1.try_into_dictionary()?;
+                let mut status: Status = Default::default();
+
+                while let Some(pair) = decoder.next_pair()? {
+                    dbg!(std::str::from_utf8(pair.0).unwrap());
+                    match pair {
+                        (b"complete", _) => {
+                            status.seeders = u32::decode_bencode_object(pair.1)?;
+                        }
+                        (b"incomplete", _) => {
+                            status.leechers = u32::decode_bencode_object(pair.1)?;
+                        }
+                        (b"downloaded", _) => {
+                            let err = u32::decode_bencode_object(pair.1);
+                            dbg!(err.unwrap());
+                        }
+                        _ => {}
+                    }
+                }
+                result.push((file.0.to_vec(), status));
+            }
+        }
+        Ok(Self { files: result })
     }
 }
