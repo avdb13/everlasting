@@ -22,7 +22,7 @@ pub fn encode(arr: &[u8]) -> String {
 pub struct MagnetInfo {
     pub hash: String,
     pub name: String,
-    pub tracker: String,
+    pub trackers: Vec<String>,
 }
 
 pub fn magnet_decoder(s: String) -> Result<MagnetInfo, Report> {
@@ -37,7 +37,7 @@ pub fn magnet_decoder(s: String) -> Result<MagnetInfo, Report> {
                 info.hash = s;
             }
             ("tr", s) => {
-                info.tracker = s;
+                info.trackers.push(s);
             }
             ("dn", s) => {
                 info.name = s;
