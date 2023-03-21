@@ -4,6 +4,14 @@ use color_eyre::Report;
 use rand::seq::IteratorRandom;
 use url::Url;
 
+pub fn decode(s: String) -> [u8; 20] {
+    let v: Vec<_> = s.chars().collect();
+    let v = v
+        .chunks(2)
+        .map(|src| src.iter().collect::<String>().parse::<u8>().unwrap())
+        .collect::<Vec<_>>();
+    v.try_into().unwrap()
+}
 pub fn encode(arr: &[u8]) -> String {
     arr.iter()
         .map(|&b| {
@@ -12,7 +20,7 @@ pub fn encode(arr: &[u8]) -> String {
                 0x30..=0x39 | 0x41..=0x59 | 0x61..=0x79 => {
                     char::from_u32(b.into()).unwrap().to_string()
                 }
-                x => format!("%{:02x}", x).to_uppercase(),
+                x => format!("%{x:02x}").to_uppercase(),
             }
         })
         .collect()
@@ -34,7 +42,8 @@ pub fn magnet_decoder(s: String) -> Result<MagnetInfo, Report> {
         match (pair.0.as_str(), pair.1) {
             // "xt", "dn", "xl", "tr", "ws", "as", "xs", "kt", "mt", "so", "x.pe",
             ("xt", s) => {
-                info.hash = s;
+                let url = s.split(':').last().unwrap();
+                info.hash = url.to_owned();
             }
             ("tr", s) => {
                 info.trackers.push(s);

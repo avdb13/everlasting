@@ -1,0 +1,226 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+use color_eyre::Report;
+use rand::Rng;
+
+pub trait Response {
+    fn to_response(v: &[u8]) -> Result<Self, Report>
+    where
+        Self: Sized;
+}
+
+pub trait Request {
+    fn to_request(&self) -> Vec<u8>;
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectReq {
+    pub cid: i64,
+    pub action: i32,
+    pub tid: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectResp {
+    pub action: i32,
+    pub tid: i32,
+    pub cid: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnounceReq<'a> {
+    pub cid: i64,
+    pub action: i32,
+    pub tid: i32,
+    pub hash: &'a [u8; 20],
+    pub peer_id: &'a [u8; 20],
+    pub downloaded: i64,
+    pub left: i64,
+    pub uploaded: i64,
+    pub event: Event,
+    pub socket: SocketAddr,
+    pub key: u32,
+    pub num_want: i32,
+    pub extensions: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnnounceResp {
+    pub action: i32,
+    pub tid: i32,
+    pub interval: i32,
+    pub leechers: i32,
+    pub seeders: i32,
+    pub peers: Vec<SocketAddr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScrapeReq<'a> {
+    pub cid: i64,
+    pub action: i32,
+    pub tid: i32,
+    pub hashes: Vec<&'a [u8; 20]>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScrapeResp {
+    pub action: i32,
+    pub tid: i32,
+    pub hashes: Vec<Status>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Status {
+    complete: i32,
+    downloaded: i32,
+    incomplete: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackerError {
+    action: i32,
+    tid: i32,
+    error: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum Event {
+    Inactive = 0,
+    Completed,
+    Started,
+    Stopped,
+}
+
+impl ConnectReq {
+    pub fn build() -> Self {
+        Self {
+            cid: 0x41727101980_i64,
+            action: 0_i32,
+            tid: rand::thread_rng().gen::<i32>(),
+        }
+    }
+}
+
+impl Request for ConnectReq {
+    fn to_request(&self) -> Vec<u8> {
+        [
+            self.cid.to_be_bytes().to_vec(),
+            [self.action.to_be_bytes(), self.tid.to_be_bytes()].concat(),
+        ]
+        .concat()
+    }
+}
+
+impl Response for ConnectResp {
+    fn to_response(v: &[u8]) -> Result<Self, Report> {
+        Ok(Self {
+            action: i32::from_be_bytes(v[0..4].try_into()?),
+            tid: i32::from_be_bytes(v[4..8].try_into()?),
+            cid: i64::from_be_bytes(v[8..16].try_into()?),
+        })
+    }
+}
+
+impl Request for AnnounceReq<'_> {
+    fn to_request(&self) -> Vec<u8> {
+        let ip = match self.socket.ip() {
+            IpAddr::V4(ip) => ip.octets().to_vec(),
+            IpAddr::V6(ip) => ip.octets().to_vec(),
+        };
+
+        [
+            self.cid.to_be_bytes().as_slice(),
+            self.action.to_be_bytes().as_slice(),
+            self.tid.to_be_bytes().as_slice(),
+            self.hash,
+            self.peer_id,
+            self.downloaded.to_be_bytes().as_slice(),
+            self.left.to_be_bytes().as_slice(),
+            self.uploaded.to_be_bytes().as_slice(),
+            (self.event.clone() as u8).to_be_bytes().as_slice(),
+            &ip,
+            self.key.to_be_bytes().as_slice(),
+            self.num_want.to_be_bytes().as_slice(),
+            self.socket.port().to_be_bytes().as_slice(),
+            self.extensions.to_be_bytes().as_slice(),
+        ]
+        .concat()
+    }
+}
+
+impl Response for AnnounceResp {
+    fn to_response(v: &[u8]) -> Result<Self, Report>
+    where
+        Self: Sized,
+    {
+        let n = v[16..].len() / (std::mem::size_of::<i32>() + std::mem::size_of::<u8>());
+
+        Ok(Self {
+            action: i32::from_be_bytes(v[0..4].try_into()?),
+            tid: i32::from_be_bytes(v[4..8].try_into()?),
+            interval: i32::from_be_bytes(v[8..12].try_into()?),
+            leechers: i32::from_be_bytes(v[12..16].try_into()?),
+            seeders: i32::from_be_bytes(v[12..16].try_into()?),
+            peers: v[16..]
+                .chunks(n)
+                .map(|x| {
+                    SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(x[0], x[1], x[2], x[3])),
+                        u16::from_be_bytes(x[4..6].try_into().unwrap()),
+                    )
+                })
+                .collect(),
+        })
+    }
+}
+
+impl Request for ScrapeReq<'_> {
+    fn to_request(&self) -> Vec<u8> {
+        [
+            self.cid.to_be_bytes().as_slice(),
+            self.action.to_be_bytes().as_slice(),
+            self.tid.to_be_bytes().as_slice(),
+            &self
+                .hashes
+                .iter()
+                .flat_map(|v| v.to_vec())
+                .collect::<Vec<_>>(),
+        ]
+        .concat()
+    }
+}
+
+impl Response for ScrapeResp {
+    fn to_response(v: &[u8]) -> Result<Self, Report>
+    where
+        Self: Sized,
+    {
+        let n = v[8..].len() / (std::mem::size_of::<i32>() * 3);
+
+        Ok(Self {
+            action: i32::from_be_bytes(v[0..4].try_into()?),
+            tid: i32::from_be_bytes(v[4..8].try_into()?),
+            hashes: v[8..]
+                .chunks(n)
+                .map(|x| Status {
+                    complete: i32::from_be_bytes(x[0..4].try_into().unwrap()),
+                    downloaded: i32::from_be_bytes(x[4..8].try_into().unwrap()),
+                    incomplete: i32::from_be_bytes(x[8..12].try_into().unwrap()),
+                })
+                .collect(),
+        })
+    }
+}
+
+impl Response for TrackerError {
+    fn to_response(v: &[u8]) -> Result<Self, Report>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            action: i32::from_be_bytes(v[0..4].try_into()?),
+            tid: i32::from_be_bytes(v[4..8].try_into()?),
+            error: std::str::from_utf8(&v[8..])?.to_owned(),
+        })
+    }
+}

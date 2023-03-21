@@ -1,20 +1,19 @@
-use std::{io::ErrorKind, net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use color_eyre::Report;
-use rand::Rng;
-use tokio::{
-    io,
-    net::UdpSocket,
-    time::{sleep, Instant},
-};
+use tokio::{net::UdpSocket, time::timeout};
+
+use crate::udp::{AnnounceReq, AnnounceResp, ConnectReq, ConnectResp, Request, Response};
 
 pub type RoutingTable = Vec<Node>;
 
-#[derive(Default)]
+#[derive(Clone)]
 pub struct DHT {
-    // pub node: Node,
+    pub socket: Arc<UdpSocket>,
+    pub target: Option<SocketAddr>,
 }
+
 pub struct Node {
     pub id: [u8; 20],
     pub routing_table: RoutingTable,
@@ -31,45 +30,67 @@ impl Node {
 }
 
 impl DHT {
-    pub async fn connect(&self, src: SocketAddr, dst: SocketAddr) -> Result<(), Report> {
-        let (cid, action, tid) = (
-            0x41727101980_i64.to_be_bytes(),
-            0_i32.to_be_bytes(),
-            rand::thread_rng().gen::<i32>().to_be_bytes(),
-        );
-        let packet = [cid.to_vec(), [action, tid].concat()].concat();
-        dbg!(&packet);
-        let socket = UdpSocket::bind(src).await?;
+    pub async fn announce(&self, packet: AnnounceReq<'_>) -> Result<AnnounceResp, Report> {
+        let mut i = 0;
+        let mut resp = [0; 1024 * 100];
+        self.socket.connect(self.target.unwrap()).await?;
 
-        dbg!(&dst);
-        socket.connect(dst).await?;
-
-        match socket.try_send(&packet) {
+        match self.socket.send(&packet.to_request()).await {
             Ok(n) => {
                 println!("sent {n} bytes");
             }
-            // False-positive, continue
-            Err(ref e) if e.kind() == tokio::io::ErrorKind::WouldBlock => {}
             Err(e) => {
                 return Err(e.into());
             }
         }
+        match timeout(Duration::from_secs(3), self.socket.recv(&mut resp[..])).await {
+            Err(_) => {
+                println!("did not receive value within 3 seconds");
+            }
+            Ok(r) => match r {
+                Ok(n) => {
+                    i = n;
+                }
+                Err(e) => return Err(e.into()),
+            },
+        };
 
+        AnnounceResp::to_response(&resp[..i])
+    }
+
+    pub async fn connect(
+        &self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        packet: ConnectReq,
+    ) -> Result<ConnectResp, Report> {
         let mut data = [0; 1024 * 100];
-        match socket.try_recv(&mut data[..]) {
-            Ok(n) => {
-                println!("received {n} bytes");
+        let mut i = 0;
+
+        for _ in 0..4 {
+            match self.socket.send_to(&packet.to_request(), dst).await {
+                Ok(n) => {
+                    println!("sent {n} bytes");
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
             }
-            // False-positive, continue
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                println!("sleeping ...");
-                sleep(Duration::from_secs(15)).await;
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
+
+            match timeout(Duration::from_secs(15), self.socket.recv(&mut data[..])).await {
+                Err(_) => {
+                    println!("did not receive value within 15 seconds");
+                }
+                Ok(r) => match r {
+                    Ok(n) => {
+                        i = n;
+                        break;
+                    }
+                    Err(e) => return Err(e.into()),
+                },
+            };
         }
 
-        Ok(())
+        ConnectResp::to_response(data[..i].try_into()?)
     }
 }

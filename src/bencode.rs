@@ -6,10 +6,10 @@ use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 
 use crate::data::{
-    File, Info, Metadata, Mode, MultiInfo, Peer, Response, ScrapeResponse, SingleInfo, Status,
+    File, HttpResponse, Info, Metadata, Mode, MultiInfo, Peer, ScrapeResponse, SingleInfo, Status,
 };
 
-impl FromBencode for Response {
+impl FromBencode for HttpResponse {
     const EXPECTED_RECURSION_DEPTH: usize = 5;
 
     fn decode_bencode_object(
@@ -20,7 +20,7 @@ impl FromBencode for Response {
     {
         let mut dict = object.try_into_dictionary()?;
 
-        let mut resp = Response::default();
+        let mut resp = HttpResponse::default();
 
         while let Some(pair) = dict.next_pair()? {
             dbg!(&std::str::from_utf8(pair.0).unwrap());
