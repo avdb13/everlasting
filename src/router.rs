@@ -2,16 +2,27 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use color_eyre::Report;
-use tokio::{net::UdpSocket, time::timeout};
+use once_cell::sync::OnceCell;
+use tokio::{net::UdpSocket, sync::mpsc::Receiver, time::timeout};
+use tracing::debug;
 
-use crate::udp::{AnnounceReq, AnnounceResp, ConnectReq, ConnectResp, Request, Response};
+use crate::{
+    app::Action,
+    helpers::MagnetInfo,
+    udp::{AnnounceReq, AnnounceResp, ConnectReq, ConnectResp, Request, Response},
+    GeneralError,
+};
 
 pub type RoutingTable = Vec<Node>;
 
 #[derive(Clone)]
-pub struct DHT {
+pub struct Router {
+    pub target: OnceCell<SocketAddr>,
+    pub tid: OnceCell<i32>,
+    pub cid: OnceCell<i64>,
     pub socket: Arc<UdpSocket>,
-    pub target: Option<SocketAddr>,
+    pub connected: bool,
+    pub queue: Vec<MagnetInfo>,
 }
 
 pub struct Node {
@@ -29,15 +40,16 @@ impl Node {
     }
 }
 
-impl DHT {
+impl Router {
     pub async fn announce(&self, packet: AnnounceReq<'_>) -> Result<AnnounceResp, Report> {
-        let mut i = 0;
+        let mut i = None;
         let mut resp = [0; 1024 * 100];
-        self.socket.connect(self.target.unwrap()).await?;
+        self.socket.connect(self.target.get().unwrap()).await?;
 
         match self.socket.send(&packet.to_request()).await {
             Ok(n) => {
-                println!("sent {n} bytes");
+                debug!("ANNOUNCE: sent {n} bytes");
+                debug!("ANNOUNCE: {:?}", &packet);
             }
             Err(e) => {
                 return Err(e.into());
@@ -45,17 +57,18 @@ impl DHT {
         }
         match timeout(Duration::from_secs(3), self.socket.recv(&mut resp[..])).await {
             Err(_) => {
-                println!("did not receive value within 3 seconds");
+                debug!("ANNOUNCE: did not receive value within 3 seconds");
+                return Err(GeneralError::Timeout.into());
             }
             Ok(r) => match r {
                 Ok(n) => {
-                    i = n;
+                    i = Some(n);
                 }
                 Err(e) => return Err(e.into()),
             },
         };
 
-        AnnounceResp::to_response(&resp[..i])
+        AnnounceResp::to_response(&resp[..i.unwrap()])
     }
 
     pub async fn connect(
@@ -70,7 +83,8 @@ impl DHT {
         for _ in 0..4 {
             match self.socket.send_to(&packet.to_request(), dst).await {
                 Ok(n) => {
-                    println!("sent {n} bytes");
+                    debug!("CONNECT: sent {n} bytes");
+                    debug!("CONNECT: {:?}", &packet);
                 }
                 Err(e) => {
                     return Err(e.into());
@@ -79,7 +93,7 @@ impl DHT {
 
             match timeout(Duration::from_secs(15), self.socket.recv(&mut data[..])).await {
                 Err(_) => {
-                    println!("did not receive value within 15 seconds");
+                    debug!("CONNECT: did not receive value within 15 seconds");
                 }
                 Ok(r) => match r {
                     Ok(n) => {

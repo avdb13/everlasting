@@ -1,14 +1,25 @@
-use std::slice::Iter;
-
 use color_eyre::Report;
-use rand::seq::IteratorRandom;
 use url::Url;
+
+pub fn prettier(s: String) -> String {
+    s.chars()
+        .map(|c| {
+            if c == '(' || c == '{' || c == ',' {
+                c.to_string() + "\n"
+            } else if c == ')' || c == '}' {
+                "\n".to_string() + &c.to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
 
 pub fn decode(s: String) -> [u8; 20] {
     let v: Vec<_> = s.chars().collect();
     let v = v
         .chunks(2)
-        .map(|src| src.iter().collect::<String>().parse::<u8>().unwrap())
+        .map(|src| u8::from_str_radix(&src.iter().collect::<String>(), 16).unwrap())
         .collect::<Vec<_>>();
     v.try_into().unwrap()
 }
@@ -26,7 +37,7 @@ pub fn encode(arr: &[u8]) -> String {
         .collect()
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct MagnetInfo {
     pub hash: String,
     pub name: String,
@@ -54,8 +65,6 @@ pub fn magnet_decoder(s: String) -> Result<MagnetInfo, Report> {
             _ => {}
         }
     }
-
-    dbg!(&info);
 
     Ok(info)
 }
