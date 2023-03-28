@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::udp::{AnnounceReq, Event, Request, Response};
 use app::Action;
+use color_eyre::config::PanicHook;
 use color_eyre::{eyre::eyre, Report};
 use crossterm::event::DisableMouseCapture;
 use crossterm::execute;
@@ -15,14 +16,18 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use reqwest::ClientBuilder;
 use router::Router;
+use std::collections::VecDeque;
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, io};
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{
+    self, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
 use tokio::sync::oneshot;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -31,7 +36,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tui::backend::CrosstermBackend;
 use tui::Terminal;
 use url::Url;
-use writer::MyWriter;
+use writer::Writer;
 
 pub mod app;
 pub mod bencode;
@@ -81,15 +86,18 @@ fn reset_terminal() -> Result<(), Report> {
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
+    color_eyre::install()?;
+
     let panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         reset_terminal().unwrap();
         panic(info)
     }));
 
-    color_eyre::install()?;
-
-    let writer = MyWriter::default();
+    let (tx_stdout, rx_stdout): (UnboundedSender<String>, UnboundedReceiver<String>) =
+        unbounded_channel();
+    let writer = Writer::new(tx_stdout);
+    let clone = writer.clone();
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
@@ -101,7 +109,7 @@ async fn main() -> Result<(), Report> {
                 .with_level(false)
                 .with_target(false)
                 .with_ansi(false)
-                .with_writer(move || writer.clone()),
+                .with_writer(move || clone.clone()),
         )
         .init();
 
@@ -126,28 +134,28 @@ async fn main() -> Result<(), Report> {
     let mut term = Terminal::new(backend)?;
     term.hide_cursor()?;
 
-    let (tx, mut rx): (mpsc::Sender<Action>, mpsc::Receiver<Action>) = mpsc::channel(10);
-    let (err_tx, mut err_rx): (oneshot::Sender<Report>, oneshot::Receiver<Report>) =
-        oneshot::channel();
+    let (tx_actions, mut rx_actions): (mpsc::Sender<Action>, mpsc::Receiver<Action>) =
+        mpsc::channel(100);
+    let (tx_err, rx_err): (oneshot::Sender<Report>, oneshot::Receiver<Report>) = oneshot::channel();
 
     let tick_rate = Duration::from_millis(250);
-    let mut app = App::new(tx, tick_rate, writer.clone());
+    let mut app = App::new(tx_actions, tick_rate);
 
     tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
+        while let Some(msg) = rx_actions.recv().await {
             let router = router.lock().await;
 
             if let Err(e) = match msg {
                 Action::Connect => connect(&router, src).await,
                 Action::Announce => announce(&router).await,
             } {
-                err_tx.send(e).unwrap();
+                tx_err.send(e).unwrap();
                 break;
             }
         }
     });
 
-    app.run(&mut term).await?;
+    app.run(&mut term, (rx_stdout, rx_err)).await?;
 
     reset_terminal()?;
 
@@ -163,7 +171,7 @@ pub async fn connect(router: &Router, src: SocketAddr) -> Result<(), Report> {
         let router = router.clone();
 
         Box::pin(async move {
-            tracing::debug!("trying {} as tracker ...", s);
+            debug!("trying {} as tracker ...", s);
             let url = Url::parse(s)?;
             let dst = (url.host_str().unwrap(), url.port().unwrap())
                 .to_socket_addrs()

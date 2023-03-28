@@ -15,7 +15,7 @@ use crate::{
 
 pub type RoutingTable = Vec<Node>;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Router {
     pub target: OnceCell<SocketAddr>,
     pub tid: OnceCell<i32>,

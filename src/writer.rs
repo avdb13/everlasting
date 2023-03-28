@@ -1,36 +1,28 @@
-use std::io::Error;
-use std::{
-    io::{Read, Write},
-    sync::{Arc, Mutex},
-};
+use std::{io::Write, sync::Arc};
+use tokio::sync::mpsc::UnboundedSender as Sender;
+use tracing::info;
 
-use tokio::sync::mpsc::Sender;
-
-#[derive(Default, Clone)]
-pub struct MyWriter {
-    buffer: Vec<u8>,
-    pub tx: Option<Sender<Vec<String>>>,
+#[derive(Clone)]
+pub struct Writer {
+    tx: Sender<String>,
 }
 
-impl Write for MyWriter {
+impl Writer {
+    pub fn new(tx: Sender<String>) -> Self {
+        Self { tx }
+    }
+}
+
+impl Write for Writer {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.append(&mut buf.to_vec());
-        Ok(buf.len())
+        let s = std::str::from_utf8(buf).unwrap();
+        info!("wrote {s}");
+        self.tx.send(s.to_owned()).unwrap();
+
+        Ok(s.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let s = std::str::from_utf8(&self.buffer).unwrap();
-        if let Some(tx) = self.tx {
-            tx.send(s.split('\n').map(ToOwned::to_owned).collect());
-            self.buffer.clear();
-            Ok(())
-        } else {
-            Err(Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "receive channel non-existent",
-            ))
-        }
+        Ok(())
     }
-
-    fn split(&mut self) -> (Vec<u8>, MyWriter) {}
 }
