@@ -1,24 +1,24 @@
 use std::collections::VecDeque;
 use std::{
     io::Write,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use color_eyre::Report;
 use crossterm::event::Event;
-use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{Sender, UnboundedReceiver};
 use tokio::sync::{oneshot, RwLock};
 use tui::{
     backend::Backend,
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Span, Spans, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Row, Table, TableState},
+    text::{Span, Text},
+    widgets::{Block, Borders, List, ListItem, ListState, Row, Table, TableState},
     Frame, Terminal,
 };
 
-use crate::{helpers::prettier, writer::Writer};
+use crate::helpers::prettier;
 
 pub struct App {
     actions: StatefulList<String>,
@@ -39,7 +39,7 @@ impl App {
             actions: StatefulList::new(titles.clone()),
             table: StatefulTable::new(titles),
             stdout: StatefulList::new(Vec::new()),
-            buffer: Arc::new(RwLock::new(VecDeque::new())),
+            buffer: Default::default(),
             tick_rate,
             tx_actions,
         }

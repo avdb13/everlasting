@@ -1,7 +1,7 @@
 use hex::FromHex;
-use std::convert::TryFrom;
 
-use bendy::decoding::{Decoder, DictDecoder, FromBencode, Object};
+
+use bendy::decoding::{Decoder, FromBencode, Object};
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 
@@ -295,14 +295,14 @@ impl FromBencode for Metadata {
                         let mut x = x.try_into_list()?;
 
                         let fst = x.next_object()?;
-                        let fst = String::decode_bencode_object(fst.unwrap()).unwrap();
+                        let _fst = String::decode_bencode_object(fst.unwrap()).unwrap();
 
                         let snd = x.next_object()?;
-                        let snd = u64::decode_bencode_object(snd.unwrap()).unwrap();
+                        let _snd = u64::decode_bencode_object(snd.unwrap()).unwrap();
                     }
                 }
                 _ => {
-                    let s = String::decode_bencode_object(pair.1)?;
+                    let _s = String::decode_bencode_object(pair.1)?;
                 }
             }
         }

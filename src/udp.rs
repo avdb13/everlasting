@@ -4,9 +4,20 @@ use color_eyre::Report;
 use rand::Rng;
 
 pub trait Response {
-    fn to_response(v: &[u8]) -> Result<Self, Report>
+    type Packet: AsRef<[u8]>;
+
+    fn to_response(v: Self::Packet) -> Result<Self, Report>
     where
-        Self: Sized;
+        Self: Sized + Response;
+
+    fn to_type(&self) -> RespType;
+}
+
+pub enum RespType {
+    Connect = 0,
+    Announce,
+    Scrape,
+    Error,
 }
 
 pub trait Request {
@@ -119,15 +130,14 @@ impl Response for ConnectResp {
             cid: i64::from_be_bytes(v[8..16].try_into()?),
         })
     }
+
+    fn to_type(&self) -> RespType {
+        RespType::Connect
+    }
 }
 
 impl Request for AnnounceReq<'_> {
     fn to_request(&self) -> Vec<u8> {
-        let ip = match self.socket.ip() {
-            IpAddr::V4(ip) => ip.octets().to_vec(),
-            IpAddr::V6(ip) => ip.octets().to_vec(),
-        };
-
         [
             self.cid.to_be_bytes().as_slice(),
             self.action.to_be_bytes().as_slice(),
@@ -138,10 +148,10 @@ impl Request for AnnounceReq<'_> {
             self.left.to_be_bytes().as_slice(),
             self.uploaded.to_be_bytes().as_slice(),
             (self.event.clone() as u8).to_be_bytes().as_slice(),
-            &ip,
+            &Ipv4Addr::new(0, 0, 0, 0).octets(),
             self.key.to_be_bytes().as_slice(),
             self.num_want.to_be_bytes().as_slice(),
-            self.socket.port().to_be_bytes().as_slice(),
+            1317u16.to_be_bytes().as_slice(),
             self.extensions.to_be_bytes().as_slice(),
         ]
         .concat()
@@ -153,16 +163,10 @@ impl Response for AnnounceResp {
     where
         Self: Sized,
     {
-        let n = v[16..].len() / (std::mem::size_of::<i32>() + std::mem::size_of::<u8>());
-
-        Ok(Self {
-            action: i32::from_be_bytes(v[0..4].try_into()?),
-            tid: i32::from_be_bytes(v[4..8].try_into()?),
-            interval: i32::from_be_bytes(v[8..12].try_into()?),
-            leechers: i32::from_be_bytes(v[12..16].try_into()?),
-            seeders: i32::from_be_bytes(v[12..16].try_into()?),
-            peers: v[16..]
-                .chunks(n)
+        let peers = match v.len() {
+            n if n < 20 => Vec::new(),
+            _ => v[20..]
+                .chunks(6)
                 .map(|x| {
                     SocketAddr::new(
                         IpAddr::V4(Ipv4Addr::new(x[0], x[1], x[2], x[3])),
@@ -170,7 +174,24 @@ impl Response for AnnounceResp {
                     )
                 })
                 .collect(),
+        };
+
+        Ok(Self {
+            // 0, 0, 0, 0
+            action: i32::from_be_bytes(v[0..4].try_into()?),
+            // 240, 23, 226, 211
+            tid: i32::from_be_bytes(v[4..8].try_into()?),
+            // 117, 26, 194, 111
+            interval: i32::from_be_bytes(v[8..12].try_into()?),
+            // 6, 180, 52, 126
+            leechers: i32::from_be_bytes(v[12..16].try_into()?),
+            seeders: i32::from_be_bytes(v[16..20].try_into()?),
+            peers,
         })
+    }
+
+    fn to_type(&self) -> RespType {
+        RespType::Announce
     }
 }
 
@@ -210,6 +231,10 @@ impl Response for ScrapeResp {
                 .collect(),
         })
     }
+
+    fn to_type(&self) -> RespType {
+        RespType::Scrape
+    }
 }
 
 impl Response for TrackerError {
@@ -222,5 +247,9 @@ impl Response for TrackerError {
             tid: i32::from_be_bytes(v[4..8].try_into()?),
             error: std::str::from_utf8(&v[8..])?.to_owned(),
         })
+    }
+
+    fn to_type(&self) -> RespType {
+        RespType::Error
     }
 }

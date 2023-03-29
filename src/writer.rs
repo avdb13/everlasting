@@ -1,4 +1,4 @@
-use std::{io::Write, sync::Arc};
+use std::io::Write;
 use tokio::sync::mpsc::UnboundedSender as Sender;
 use tracing::info;
 

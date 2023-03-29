@@ -1,9 +1,3 @@
-use std::net::SocketAddr;
-
-use bendy::decoding::{self, DictDecoder};
-use color_eyre::Report;
-use rand::Rng;
-
 #[derive(Default, Debug, Eq, PartialEq)]
 pub struct Metadata {
     pub info: Info,

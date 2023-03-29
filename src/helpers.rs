@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use color_eyre::Report;
 use url::Url;
 
@@ -44,8 +46,8 @@ pub struct MagnetInfo {
     pub trackers: Vec<String>,
 }
 
-pub fn magnet_decoder(s: String) -> Result<MagnetInfo, Report> {
-    let url = Url::parse(&s)?;
+pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
+    let url = Url::parse(s.as_ref())?;
     let pairs = url.query_pairs().into_owned();
 
     let mut info = MagnetInfo::default();

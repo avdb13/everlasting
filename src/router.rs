@@ -2,14 +2,17 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use color_eyre::Report;
+use either::Either;
 use once_cell::sync::OnceCell;
 use tokio::{net::UdpSocket, sync::mpsc::Receiver, time::timeout};
 use tracing::debug;
 
 use crate::{
-    app::Action,
     helpers::MagnetInfo,
-    udp::{AnnounceReq, AnnounceResp, ConnectReq, ConnectResp, Request, Response},
+    udp::{
+        AnnounceReq, AnnounceResp, ConnectReq, ConnectResp, Request, RespType, Response, ScrapeReq,
+        TrackerError,
+    },
     GeneralError,
 };
 
@@ -20,6 +23,7 @@ pub struct Router {
     pub target: OnceCell<SocketAddr>,
     pub tid: OnceCell<i32>,
     pub cid: OnceCell<i64>,
+
     pub socket: Arc<UdpSocket>,
     pub connected: bool,
     pub queue: Vec<MagnetInfo>,
@@ -35,48 +39,65 @@ pub struct Bucket {
 }
 
 impl Node {
-    fn compare(&self, hash: [u8; 20]) -> [u8; 20] {
+    fn compare(&self, _hash: [u8; 20]) -> [u8; 20] {
         todo!()
     }
 }
 
-impl Router {
-    pub async fn announce(&self, packet: AnnounceReq<'_>) -> Result<AnnounceResp, Report> {
-        let mut i = None;
+impl<'a> Router {
+    pub async fn process_response<P: AsRef<[u8]>>(&self, packet: P) -> Result<(), Report> {
+        match packet.as_ref()[4] {
+            0 => {
+                let resp = ConnectResp::to_response(packet)?;
+            }
+            1 => {
+                let resp = AnnounceResp::to_response(packet)?;
+            }
+            2 => {
+                let resp = ScrapeReq::to_response(packet)?;
+            }
+            3 => {
+                let resp = TrackerError::to_response(packet)?;
+            }
+        }
+
+        Ok(())
+    }
+    pub async fn announce(&self, packet: AnnounceReq<'_>) -> Result<Vec<u8>, Report> {
         let mut resp = [0; 1024 * 100];
         self.socket.connect(self.target.get().unwrap()).await?;
 
         match self.socket.send(&packet.to_request()).await {
             Ok(n) => {
                 debug!("ANNOUNCE: sent {n} bytes");
-                debug!("ANNOUNCE: {:?}", &packet);
+                debug!("ANNOUNCE: {:?}", &packet.to_request());
             }
             Err(e) => {
                 return Err(e.into());
             }
         }
-        match timeout(Duration::from_secs(3), self.socket.recv(&mut resp[..])).await {
+        let i = match timeout(Duration::from_secs(3), self.socket.recv(&mut resp[..])).await {
             Err(_) => {
                 debug!("ANNOUNCE: did not receive value within 3 seconds");
                 return Err(GeneralError::Timeout.into());
             }
             Ok(r) => match r {
-                Ok(n) => {
-                    i = Some(n);
-                }
+                Ok(n) => n,
                 Err(e) => return Err(e.into()),
             },
         };
 
-        AnnounceResp::to_response(&resp[..i.unwrap()])
+        debug!("AnnounceResp: {:?}", &resp[..i]);
+
+        Ok(resp[..i].to_vec())
     }
 
     pub async fn connect(
         &self,
-        src: SocketAddr,
+        _src: SocketAddr,
         dst: SocketAddr,
         packet: ConnectReq,
-    ) -> Result<ConnectResp, Report> {
+    ) -> Result<Vec<u8>, Report> {
         let mut data = [0; 1024 * 100];
         let mut i = 0;
 
@@ -84,7 +105,7 @@ impl Router {
             match self.socket.send_to(&packet.to_request(), dst).await {
                 Ok(n) => {
                     debug!("CONNECT: sent {n} bytes");
-                    debug!("CONNECT: {:?}", &packet);
+                    debug!("CONNECT: {:?}", &packet.to_request());
                 }
                 Err(e) => {
                     return Err(e.into());
@@ -105,6 +126,6 @@ impl Router {
             };
         }
 
-        ConnectResp::to_response(data[..i].try_into()?)
+        Ok(data[..i].to_vec())
     }
 }
