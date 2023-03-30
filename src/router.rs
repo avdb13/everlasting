@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Utc};
 use color_eyre::Report;
@@ -45,40 +45,25 @@ impl Node {
 }
 
 impl<'a> Router {
-    pub async fn process_response<P: AsRef<[u8]>>(&self, packet: P) -> Result<(), Report> {
-        match packet.as_ref()[4] {
-            0 => {
-                let resp = ConnectResp::to_response(packet)?;
-            }
-            1 => {
-                let resp = AnnounceResp::to_response(packet)?;
-            }
-            2 => {
-                let resp = ScrapeReq::to_response(packet)?;
-            }
-            3 => {
-                let resp = TrackerError::to_response(packet)?;
-            }
-        }
-
-        Ok(())
-    }
     pub async fn announce(&self, packet: AnnounceReq<'_>) -> Result<Vec<u8>, Report> {
         let mut resp = [0; 1024 * 100];
         self.socket.connect(self.target.get().unwrap()).await?;
 
         match self.socket.send(&packet.to_request()).await {
             Ok(n) => {
-                debug!("ANNOUNCE: sent {n} bytes");
-                debug!("ANNOUNCE: {:?}", &packet.to_request());
+                debug!(
+                    "[ANNOUNCE] sent {n} bytes: ({:?}) {:?}",
+                    std::any::type_name::<AnnounceReq>(),
+                    &packet.to_request(),
+                );
             }
             Err(e) => {
                 return Err(e.into());
             }
         }
-        let i = match timeout(Duration::from_secs(3), self.socket.recv(&mut resp[..])).await {
+        let n = match timeout(Duration::from_secs(3), self.socket.recv(&mut resp[..])).await {
             Err(_) => {
-                debug!("ANNOUNCE: did not receive value within 3 seconds");
+                debug!("[ANNOUNCE] did not receive value within 3 seconds");
                 return Err(GeneralError::Timeout.into());
             }
             Ok(r) => match r {
@@ -87,9 +72,13 @@ impl<'a> Router {
             },
         };
 
-        debug!("AnnounceResp: {:?}", &resp[..i]);
+        debug!(
+            "[ANNOUNCE] received {n} bytes: ({:?}) {:?}",
+            std::any::type_name::<AnnounceResp>(),
+            &resp[..n]
+        );
 
-        Ok(resp[..i].to_vec())
+        Ok(resp[..n].to_vec())
     }
 
     pub async fn connect(
@@ -97,28 +86,33 @@ impl<'a> Router {
         _src: SocketAddr,
         dst: SocketAddr,
         packet: ConnectReq,
-    ) -> Result<Vec<u8>, Report> {
+    ) -> Result<(ConnectResp, SocketAddr), Report> {
         let mut data = [0; 1024 * 100];
-        let mut i = 0;
+        let mut size = 0;
 
         for _ in 0..4 {
             match self.socket.send_to(&packet.to_request(), dst).await {
                 Ok(n) => {
-                    debug!("CONNECT: sent {n} bytes");
-                    debug!("CONNECT: {:?}", &packet.to_request());
+                    debug!(
+                        "[CONNECT] sent {n} bytes: ({:?}) {:?}",
+                        std::any::type_name::<ConnectReq>(),
+                        &packet.to_request()[..n]
+                    );
                 }
-                Err(e) => {
-                    return Err(e.into());
-                }
+                Err(e) => match e.kind() {
+                    ErrorKind::WouldBlock => continue,
+                    _ => return Err(e.into()),
+                },
             }
 
             match timeout(Duration::from_secs(15), self.socket.recv(&mut data[..])).await {
                 Err(_) => {
-                    debug!("CONNECT: did not receive value within 15 seconds");
+                    debug!("[CONNECT] did not receive value within 15 seconds");
                 }
                 Ok(r) => match r {
                     Ok(n) => {
-                        i = n;
+                        debug!("[CONNECT] found working tracker: {:?}", dst.clone());
+                        size = n;
                         break;
                     }
                     Err(e) => return Err(e.into()),
@@ -126,6 +120,6 @@ impl<'a> Router {
             };
         }
 
-        Ok(data[..i].to_vec())
+        ConnectResp::to_response(&data[..size]).map(|c| (c, dst))
     }
 }

@@ -2,15 +2,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use color_eyre::Report;
 use rand::Rng;
+use tracing::debug;
 
 pub trait Response {
-    type Packet: AsRef<[u8]>;
-
-    fn to_response(v: Self::Packet) -> Result<Self, Report>
+    fn to_response(v: &[u8]) -> Result<Self, Report>
     where
         Self: Sized + Response;
-
-    fn to_type(&self) -> RespType;
 }
 
 pub enum RespType {
@@ -130,10 +127,6 @@ impl Response for ConnectResp {
             cid: i64::from_be_bytes(v[8..16].try_into()?),
         })
     }
-
-    fn to_type(&self) -> RespType {
-        RespType::Connect
-    }
 }
 
 impl Request for AnnounceReq<'_> {
@@ -147,8 +140,8 @@ impl Request for AnnounceReq<'_> {
             self.downloaded.to_be_bytes().as_slice(),
             self.left.to_be_bytes().as_slice(),
             self.uploaded.to_be_bytes().as_slice(),
-            (self.event.clone() as u8).to_be_bytes().as_slice(),
-            &Ipv4Addr::new(0, 0, 0, 0).octets(),
+            (self.event.clone() as u32).to_be_bytes().as_slice(),
+            Ipv4Addr::new(0, 0, 0, 0).octets().as_slice(),
             self.key.to_be_bytes().as_slice(),
             self.num_want.to_be_bytes().as_slice(),
             1317u16.to_be_bytes().as_slice(),
@@ -189,10 +182,6 @@ impl Response for AnnounceResp {
             peers,
         })
     }
-
-    fn to_type(&self) -> RespType {
-        RespType::Announce
-    }
 }
 
 impl Request for ScrapeReq<'_> {
@@ -231,10 +220,6 @@ impl Response for ScrapeResp {
                 .collect(),
         })
     }
-
-    fn to_type(&self) -> RespType {
-        RespType::Scrape
-    }
 }
 
 impl Response for TrackerError {
@@ -247,9 +232,5 @@ impl Response for TrackerError {
             tid: i32::from_be_bytes(v[4..8].try_into()?),
             error: std::str::from_utf8(&v[8..])?.to_owned(),
         })
-    }
-
-    fn to_type(&self) -> RespType {
-        RespType::Error
     }
 }
