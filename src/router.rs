@@ -117,6 +117,8 @@ impl TryFrom<Router<Connected>> for Router<Announcing> {
         let key = rand::thread_rng().gen::<u32>();
 
         let packet = AnnounceReq::build(old.magnet.clone(), old.state.connection_id, peer_id, key);
+
+        dbg!(old.state.trackers[0], &packet);
         let ok = old.announce(old.state.trackers[0], packet).await?;
 
         Ok(Self {
@@ -146,42 +148,6 @@ impl Node {
 }
 
 impl<S> Router<S> {
-    pub async fn announce(&self, dst: SocketAddr, packet: AnnounceReq) -> Result<Vec<u8>, Report> {
-        let mut resp = [0; 1024 * 100];
-        self.socket.connect(dst).await?;
-
-        match self.socket.send(&packet.to_request()).await {
-            Ok(n) => {
-                debug!(
-                    "[ANNOUNCE] sent {n} bytes: ({:?}) {:?}",
-                    std::any::type_name::<AnnounceReq>(),
-                    &packet.to_request(),
-                );
-            }
-            Err(e) => {
-                return Err(e.into());
-            }
-        }
-        let n = match timeout(Duration::from_secs(3), self.socket.recv(&mut resp[..])).await {
-            Err(_) => {
-                debug!("[ANNOUNCE] did not receive value within 3 seconds");
-                return Err(GeneralError::Timeout.into());
-            }
-            Ok(r) => match r {
-                Ok(n) => n,
-                Err(e) => return Err(e.into()),
-            },
-        };
-
-        debug!(
-            "[ANNOUNCE] received {n} bytes: ({:?}) {:?}",
-            std::any::type_name::<AnnounceResp>(),
-            &resp[..n]
-        );
-
-        Ok(resp[..n].to_vec())
-    }
-
     pub async fn connect(
         &self,
         dst: SocketAddr,
@@ -221,5 +187,40 @@ impl<S> Router<S> {
         }
 
         ConnectResp::to_response(&data[..size]).map(|ok| (dst, ok))
+    }
+
+    pub async fn announce(&self, dst: SocketAddr, packet: AnnounceReq) -> Result<Vec<u8>, Report> {
+        let mut resp = [0; 1024 * 100];
+
+        match self.socket.send_to(&packet.to_request(), dst).await {
+            Ok(n) => {
+                debug!(
+                    "[ANNOUNCE] sent {n} bytes: ({:?}) {:?}",
+                    std::any::type_name::<AnnounceReq>(),
+                    &packet.to_request(),
+                );
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+        let n = match timeout(Duration::from_secs(3), self.socket.recv(&mut resp[..])).await {
+            Err(_) => {
+                debug!("[ANNOUNCE] did not receive value within 3 seconds");
+                return Err(GeneralError::Timeout.into());
+            }
+            Ok(r) => match r {
+                Ok(n) => n,
+                Err(e) => return Err(e.into()),
+            },
+        };
+
+        debug!(
+            "[ANNOUNCE] received {n} bytes: ({:?}) {:?}",
+            std::any::type_name::<AnnounceResp>(),
+            &resp[..n]
+        );
+
+        Ok(resp[..n].to_vec())
     }
 }

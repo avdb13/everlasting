@@ -124,15 +124,6 @@ async fn main() -> Result<(), Report> {
 
     let router: Router<Disconnected> = Router::new(src, magnet, socket);
 
-    // let router = Arc::new(Mutex::new(Router {
-    //     tid: OnceCell::new(),
-    //     target: OnceCell::new(),
-    //     cid: OnceCell::new(),
-    //     socket,
-    //     connected: false,
-    //     queue: vec![magnet_info],
-    // }));
-
     //     enable_raw_mode()?;
     //     execute!(&mut io::stdout(), EnterAlternateScreen)?;
 
@@ -195,26 +186,3 @@ async fn main() -> Result<(), Report> {
 
     Ok(())
 }
-
-// pub async fn announce(router: &Router<Announcing>) -> Result<AnnounceResp, Report> {
-//     let peer_id = rand::thread_rng().gen::<[u8; 20]>();
-//     let key = rand::thread_rng().gen::<u32>();
-
-//     let req = AnnounceReq {
-//         cid: *router.cid.get().unwrap(),
-//         action: 1i32,
-//         tid: rand::thread_rng().gen::<i32>(),
-//         hash: &decode(router.queue[0].hash.clone()),
-//         peer_id: &peer_id,
-//         downloaded: 0,
-//         left: 0,
-//         uploaded: 0,
-//         event: Event::Inactive,
-//         socket: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
-//         key,
-//         num_want: -1i32,
-//         extensions: 0u16,
-//     };
-
-//     ConnectResp::to_response(&router.announce(req.clone()).await?)
-// }

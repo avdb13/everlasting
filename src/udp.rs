@@ -158,30 +158,22 @@ impl AnnounceReq {
 impl Request for AnnounceReq {
     fn to_request(&self) -> Vec<u8> {
         let ok = [
-            // 0, 0, 4, 23, 39, 16, 25, 128
             self.cid.to_be_bytes().to_vec(),
-            // 0, 0, 0, 1
             self.action.to_be_bytes().to_vec(),
-            //
             self.tid.to_be_bytes().to_vec(),
-            // 131, 98, 60, 253, 107, 141, 17, 107, 72, 109, 190, 36, 32, 218, 5, 58, 246, 92, 241, 223, 1, 153, 60, 150, 107
             self.hash.to_vec(),
-            // 1, 167, 171, 93, 121, 173, 252, 166, 130, 188, 121, 77, 133, 175, 83, 185, 19, 253, 85
             self.peer_id.to_vec(),
             self.downloaded.to_be_bytes().to_vec(),
             self.left.to_be_bytes().to_vec(),
             self.uploaded.to_be_bytes().to_vec(),
-            (self.event.clone() as i32).to_be_bytes().to_vec(),
-            Ipv4Addr::new(0, 0, 0, 0).octets().to_vec(),
-            //  232, 204, 32, 189
+            [0, 0, 0, 0].to_vec(),
+            [0, 0, 0, 0].to_vec(),
             self.key.to_be_bytes().to_vec(),
-            // 255, 255, 255, 255
             self.num_want.to_be_bytes().to_vec(),
-            // 5, 37
             1317u16.to_be_bytes().to_vec(),
-            // 0, 0
-            self.extensions.to_be_bytes().to_vec(),
+            // self.extensions.to_be_bytes().to_vec(),
         ];
+        dbg!(&ok);
 
         ok.concat()
     }
