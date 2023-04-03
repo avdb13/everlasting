@@ -19,7 +19,7 @@ use once_cell::sync::OnceCell;
 
 use rand::Rng;
 
-use router::{Announcing, Connected, Disconnected, Router};
+use router::{Announced, Connected, Disconnected, Router};
 use tokio::time::sleep;
 use udp::{AnnounceResp, Response};
 
@@ -132,8 +132,12 @@ async fn main() -> Result<(), Report> {
     >>::try_from(router)
     .await?;
 
-    let router: Router<Announcing> =
-        <Router<router::Announcing> as async_convert::TryFrom<Router<Connected>>>::try_from(router)
+    let router =
+        <Router<router::Announced> as async_convert::TryFrom<Router<Connected>>>::try_from(router)
+            .await?;
+
+    let router =
+        <Router<router::Scraped> as async_convert::TryFrom<Router<Announced>>>::try_from(router)
             .await?;
 
     // let backend = CrosstermBackend::new(io::stdout());

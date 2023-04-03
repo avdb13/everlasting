@@ -1,4 +1,7 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::{
+    fmt::Display,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+};
 
 use color_eyre::Report;
 use rand::Rng;
@@ -68,11 +71,11 @@ pub struct AnnounceResp {
 }
 
 #[derive(Debug, Clone)]
-pub struct ScrapeReq<'a> {
+pub struct ScrapeReq {
     pub cid: i64,
     pub action: i32,
     pub tid: i32,
-    pub hashes: Vec<&'a [u8; 20]>,
+    pub hashes: Vec<[u8; 20]>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +96,7 @@ pub struct Status {
 pub struct TrackerError {
     action: i32,
     tid: i32,
-    error: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone)]
@@ -107,7 +110,7 @@ pub enum Event {
 impl ConnectReq {
     pub fn build() -> Self {
         Self {
-            cid: 0x41727101980_i64,
+            cid: PROTOCOL_ID,
             action: 0_i32,
             tid: rand::thread_rng().gen::<i32>(),
         }
@@ -136,7 +139,6 @@ impl Response for ConnectResp {
 
 impl AnnounceReq {
     pub fn build(magnet: MagnetInfo, cid: i64, peer_id: [u8; 20], key: u32) -> Self {
-        debug!("magnet is {:?}", decode(magnet.hash.clone()));
         Self {
             cid,
             action: 1i32,
@@ -173,7 +175,7 @@ impl Request for AnnounceReq {
             1317u16.to_be_bytes().to_vec(),
             // self.extensions.to_be_bytes().to_vec(),
         ];
-        dbg!(&ok);
+        debug!(?ok);
 
         ok.concat()
     }
@@ -212,7 +214,18 @@ impl Response for AnnounceResp {
     }
 }
 
-impl Request for ScrapeReq<'_> {
+impl ScrapeReq {
+    pub fn build(cid: i64, magnet: MagnetInfo) -> Self {
+        Self {
+            cid,
+            action: 2i32,
+            tid: rand::thread_rng().gen::<i32>(),
+            hashes: vec![decode(magnet.hash)],
+        }
+    }
+}
+
+impl Request for ScrapeReq {
     fn to_request(&self) -> Vec<u8> {
         [
             self.cid.to_be_bytes().as_slice(),

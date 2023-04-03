@@ -13,14 +13,18 @@ use futures::future;
 use once_cell::sync::OnceCell;
 use rand::Rng;
 use reqwest::Url;
-use tokio::{net::UdpSocket, sync::mpsc::Receiver, time::timeout};
+use tokio::{
+    net::UdpSocket,
+    sync::mpsc::Receiver,
+    time::{sleep, timeout},
+};
 use tracing::debug;
 
 use crate::{
     helpers::MagnetInfo,
     udp::{
         AnnounceReq, AnnounceResp, ConnectReq, ConnectResp, Request, RespType, Response, ScrapeReq,
-        TrackerError,
+        ScrapeResp, TrackerError,
     },
     GeneralError,
 };
@@ -30,6 +34,7 @@ pub struct Router<S> {
     pub state: S,
     pub magnet: MagnetInfo,
     src: SocketAddr,
+    dst: Option<SocketAddr>,
     pub socket: Arc<UdpSocket>,
     // pub tid: OnceCell<i32>,
 
@@ -41,15 +46,19 @@ pub struct Router<S> {
 pub struct Disconnected;
 pub struct Connected {
     trackers: Vec<SocketAddr>,
-    connection_id: i64,
+    cid: i64,
 }
-pub struct Announcing;
-pub struct Scraping;
+pub struct Announced {
+    peers: Vec<SocketAddr>,
+    cid: i64,
+}
+pub struct Scraped;
 
 impl Router<Disconnected> {
     pub fn new(src: SocketAddr, magnet: MagnetInfo, socket: Arc<UdpSocket>) -> Self {
         Self {
             src,
+            dst: None,
             magnet,
             socket,
             state: Disconnected,
@@ -98,10 +107,11 @@ impl TryFrom<Router<Disconnected>> for Router<Connected> {
 
         Ok(Self {
             src: old.src,
+            dst: Some(dst),
             magnet: old.magnet,
             socket: old.socket,
             state: Connected {
-                connection_id: resp.cid,
+                cid: resp.cid,
                 trackers: vec![dst],
             },
         })
@@ -109,21 +119,68 @@ impl TryFrom<Router<Disconnected>> for Router<Connected> {
 }
 
 #[async_trait]
-impl TryFrom<Router<Connected>> for Router<Announcing> {
+impl TryFrom<Router<Connected>> for Router<Announced> {
     type Error = Report;
 
-    async fn try_from(old: Router<Connected>) -> Result<Router<Announcing>, Self::Error> {
+    async fn try_from(old: Router<Connected>) -> Result<Router<Announced>, Self::Error> {
         let peer_id = rand::thread_rng().gen::<[u8; 20]>();
         let key = rand::thread_rng().gen::<u32>();
 
-        let packet = AnnounceReq::build(old.magnet.clone(), old.state.connection_id, peer_id, key);
+        let packet = AnnounceReq::build(old.magnet.clone(), old.state.cid, peer_id, key);
 
-        dbg!(old.state.trackers[0], &packet);
-        let ok = old.announce(old.state.trackers[0], packet).await?;
+        let mut ok = old.announce(old.dst.unwrap(), packet.clone()).await?;
+
+        loop {
+            match ok[3] {
+                0 => {
+                    let resp = ConnectResp::to_response(&ok)?;
+                    let packet = AnnounceReq::build(old.magnet.clone(), resp.cid, peer_id, key);
+                    debug!(?resp.cid);
+
+                    ok = old.announce(old.state.trackers[0], packet.clone()).await?;
+                }
+                3 => {
+                    let resp = TrackerError::to_response(&ok)?;
+                    debug!(resp.error);
+                    break;
+                }
+                _ => {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+
+        let resp = AnnounceResp::to_response(&ok)?;
 
         Ok(Self {
-            state: Announcing,
+            state: Announced {
+                peers: resp.peers,
+                cid: old.state.cid,
+            },
             magnet: old.magnet,
+            dst: old.dst,
+            src: old.src,
+            socket: old.socket,
+        })
+    }
+}
+
+#[async_trait]
+impl TryFrom<Router<Announced>> for Router<Scraped> {
+    type Error = Report;
+
+    async fn try_from(old: Router<Announced>) -> Result<Router<Scraped>, Self::Error> {
+        let packet = ScrapeReq::build(old.state.cid, old.magnet.clone());
+
+        let resp = old.scrape(old.dst.unwrap(), packet).await?;
+
+        debug!(?resp);
+
+        Ok(Self {
+            state: Scraped {},
+            magnet: old.magnet,
+            dst: old.dst,
             src: old.src,
             socket: old.socket,
         })
@@ -186,6 +243,12 @@ impl<S> Router<S> {
             };
         }
 
+        debug!(
+            "[CONNECT] received {size} bytes: ({:?}) {:?}",
+            std::any::type_name::<ConnectResp>(),
+            &data[..size]
+        );
+
         ConnectResp::to_response(&data[..size]).map(|ok| (dst, ok))
     }
 
@@ -195,9 +258,9 @@ impl<S> Router<S> {
         match self.socket.send_to(&packet.to_request(), dst).await {
             Ok(n) => {
                 debug!(
-                    "[ANNOUNCE] sent {n} bytes: ({:?}) {:?}",
+                    "[ANNOUNCE] sent {n} bytes: ({:?})",
                     std::any::type_name::<AnnounceReq>(),
-                    &packet.to_request(),
+                    // &packet.to_request(),
                 );
             }
             Err(e) => {
@@ -222,5 +285,35 @@ impl<S> Router<S> {
         );
 
         Ok(resp[..n].to_vec())
+    }
+
+    pub async fn scrape(&self, dst: SocketAddr, packet: ScrapeReq) -> Result<ScrapeResp, Report> {
+        let mut resp = [0; 1024 * 100];
+
+        match self.socket.send_to(&packet.to_request(), dst).await {
+            Ok(n) => {
+                debug!(
+                    "[SCRAPE] sent {n} bytes: ({:?})",
+                    std::any::type_name::<ScrapeReq>(),
+                    // &packet.to_request(),
+                );
+            }
+            Err(e) => {
+                return Err(e.into());
+            }
+        }
+
+        let n = match self.socket.recv(&mut resp[..]).await {
+            Ok(n) => n,
+            Err(e) => return Err(e.into()),
+        };
+
+        debug!(
+            "[SCRAPE] received {n} bytes: ({:?}) {:?}",
+            std::any::type_name::<ScrapeReq>(),
+            &resp[..n]
+        );
+
+        ScrapeResp::to_response(&resp[..n])
     }
 }
