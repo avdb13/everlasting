@@ -41,6 +41,7 @@ pub struct Router<S> {
 pub struct Disconnected;
 pub struct Connected {
     trackers: Vec<SocketAddr>,
+    connection_id: i64,
 }
 pub struct Announcing;
 pub struct Scraping;
@@ -88,8 +89,8 @@ impl TryFrom<Router<Disconnected>> for Router<Connected> {
 
         let resp = match resp {
             r if r.action == 0i32 && r.tid == packet.tid => {
-                debug!("transaction ID matches: ({}, {})", packet.tid, r.tid);
-                debug!("connection ID is {}", r.cid);
+                debug!("transaction ID matches: {:?}", packet.tid.to_be_bytes());
+                debug!("connection ID is {:?}", r.cid.to_be_bytes());
                 r
             }
             _ => return Err(GeneralError::DeadTrackers.into()),
@@ -100,6 +101,7 @@ impl TryFrom<Router<Disconnected>> for Router<Connected> {
             magnet: old.magnet,
             socket: old.socket,
             state: Connected {
+                connection_id: resp.cid,
                 trackers: vec![dst],
             },
         })
@@ -114,8 +116,8 @@ impl TryFrom<Router<Connected>> for Router<Announcing> {
         let peer_id = rand::thread_rng().gen::<[u8; 20]>();
         let key = rand::thread_rng().gen::<u32>();
 
-        let packet = AnnounceReq::build(old.magnet.clone(), peer_id, key);
-        old.announce(old.state.trackers[0], packet).await?;
+        let packet = AnnounceReq::build(old.magnet.clone(), old.state.connection_id, peer_id, key);
+        let ok = old.announce(old.state.trackers[0], packet).await?;
 
         Ok(Self {
             state: Announcing,

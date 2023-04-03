@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 
 use color_eyre::Report;
+use tracing::debug;
 use url::Url;
 
 pub fn prettier(s: String) -> String {
@@ -67,6 +68,7 @@ pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
             _ => {}
         }
     }
+    debug!(?info.hash);
 
     Ok(info)
 }
