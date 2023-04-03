@@ -4,6 +4,11 @@ use color_eyre::Report;
 use rand::Rng;
 use tracing::debug;
 
+use crate::{
+    helpers::{decode, MagnetInfo},
+    PROTOCOL_ID,
+};
+
 pub trait Response {
     fn to_response(v: &[u8]) -> Result<Self, Report>
     where
@@ -36,12 +41,12 @@ pub struct ConnectResp {
 }
 
 #[derive(Debug, Clone)]
-pub struct AnnounceReq<'a> {
+pub struct AnnounceReq {
     pub cid: i64,
     pub action: i32,
     pub tid: i32,
-    pub hash: &'a [u8; 20],
-    pub peer_id: &'a [u8; 20],
+    pub hash: [u8; 20],
+    pub peer_id: [u8; 20],
     pub downloaded: i64,
     pub left: i64,
     pub uploaded: i64,
@@ -129,25 +134,47 @@ impl Response for ConnectResp {
     }
 }
 
-impl Request for AnnounceReq<'_> {
+impl AnnounceReq {
+    pub fn build(magnet: MagnetInfo, peer_id: [u8; 20], key: u32) -> Self {
+        Self {
+            cid: PROTOCOL_ID,
+            action: 1i32,
+            tid: rand::thread_rng().gen::<i32>(),
+            hash: decode(magnet.hash),
+            peer_id,
+            downloaded: 0,
+            left: 0,
+            uploaded: 0,
+            event: Event::Inactive,
+            socket: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
+            key,
+            num_want: -1i32,
+            extensions: 0u16,
+        }
+    }
+}
+
+impl Request for AnnounceReq {
     fn to_request(&self) -> Vec<u8> {
-        [
-            self.cid.to_be_bytes().as_slice(),
-            self.action.to_be_bytes().as_slice(),
-            self.tid.to_be_bytes().as_slice(),
-            self.hash,
-            self.peer_id,
-            self.downloaded.to_be_bytes().as_slice(),
-            self.left.to_be_bytes().as_slice(),
-            self.uploaded.to_be_bytes().as_slice(),
-            (self.event.clone() as u32).to_be_bytes().as_slice(),
-            Ipv4Addr::new(0, 0, 0, 0).octets().as_slice(),
-            self.key.to_be_bytes().as_slice(),
-            self.num_want.to_be_bytes().as_slice(),
-            1317u16.to_be_bytes().as_slice(),
-            self.extensions.to_be_bytes().as_slice(),
-        ]
-        .concat()
+        let ok = [
+            self.cid.to_be_bytes().to_vec(),
+            self.action.to_be_bytes().to_vec(),
+            self.tid.to_be_bytes().to_vec(),
+            self.hash.to_vec(),
+            self.peer_id.to_vec(),
+            self.downloaded.to_be_bytes().to_vec(),
+            self.left.to_be_bytes().to_vec(),
+            self.uploaded.to_be_bytes().to_vec(),
+            (self.event.clone() as i32).to_be_bytes().to_vec(),
+            Ipv4Addr::new(0, 0, 0, 0).octets().to_vec(),
+            self.key.to_be_bytes().to_vec(),
+            self.num_want.to_be_bytes().to_vec(),
+            1317u16.to_be_bytes().to_vec(),
+            self.extensions.to_be_bytes().to_vec(),
+        ];
+
+        dbg!(&ok);
+        ok.concat()
     }
 }
 
