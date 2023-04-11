@@ -9,83 +9,245 @@ use tracing::debug;
 
 use crate::{
     helpers::{decode, MagnetInfo},
-    PROTOCOL_ID,
+    GeneralError, PROTOCOL_ID,
 };
 
-pub trait Response {
-    fn to_response(v: &[u8]) -> Result<Self, Report>
-    where
-        Self: Sized + Response;
+#[derive(Clone)]
+pub enum Request {
+    Connect {
+        cid: i64,
+        action: i32,
+        tid: i32,
+    },
+    Announce {
+        cid: i64,
+        action: i32,
+        tid: i32,
+        hash: [u8; 20],
+        peer_id: [u8; 20],
+        downloaded: i64,
+        left: i64,
+        uploaded: i64,
+        event: TransferEvent,
+        socket: SocketAddr,
+        key: u32,
+        num_want: i32,
+        extensions: u16,
+    },
+    Scrape {
+        cid: i64,
+        action: i32,
+        tid: i32,
+        hashes: Vec<[u8; 20]>,
+    },
 }
 
-pub enum RespType {
-    Connect = 0,
-    Announce,
-    Scrape,
-    Error,
+#[derive(Debug)]
+pub enum Response {
+    Connect {
+        action: i32,
+        tid: i32,
+        cid: i64,
+    },
+    Announce {
+        action: i32,
+        tid: i32,
+        interval: i32,
+        leechers: i32,
+        seeders: i32,
+        peers: Vec<SocketAddr>,
+    },
+    Scrape {
+        action: i32,
+        tid: i32,
+        hashes: Vec<Status>,
+    },
+    Error {
+        action: i32,
+        tid: i32,
+        error: String,
+    },
 }
 
-pub trait Request {
-    fn to_request(&self) -> Vec<u8>;
+impl Request {
+    // pub fn build(old: Option<(Request, Router)>) -> Request {
+    // match old {
+    //     _ => Request::Connect {
+    //         cid: PROTOCOL_ID,
+    //         action: 0_i32,
+    //         tid: rand::thread_rng().gen::<i32>(),
+    //     },
+    //     Some((Request::Connect { cid, tid, .. }, router)) => Request::Announce {
+    //         cid,
+    //         action: 1i32,
+    //         tid: rand::thread_rng().gen::<i32>(),
+    //         hash: decode(router.magnet.hash),
+    //         peer_id: router.peer_id,
+    //         downloaded: 0,
+    //         left: 0,
+    //         uploaded: 0,
+    //         event: Event::Inactive,
+    //         socket: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
+    //         key: router.,
+    //         num_want: -1i32,
+    //         extensions: 0u16,
+    //     },
+    // }
+    // }
+    //         1 => Request::Connect {
+    //     pub fn build(magnet: MagnetInfo, cid: i64, peer_id: [u8; 20], key: u32) -> Self {
+    //         Self {
+    //             cid,
+    //             action: 1i32,
+    //             tid: rand::thread_rng().gen::<i32>(),
+    //             hash: decode(magnet.hash),
+    //             peer_id,
+    //             downloaded: 0,
+    //             left: 0,
+    //             uploaded: 0,
+    //             event: Event::Inactive,
+    //             socket: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
+    //             key,
+    //             num_want: -1i32,
+    //             extensions: 0u16,
+    //         }
+    //     }
+    //     pub fn build(cid: i64, magnet: MagnetInfo) -> Self {
+    //         Self {
+    //             cid,
+    //             action: 2i32,
+    //             tid: rand::thread_rng().gen::<i32>(),
+    //             hashes: vec![decode(magnet.hash)],
+    //         }
+    //     }
+    // }
+    // cid: PROTOCOL_ID,
+    // action: 0_i32,
+    // tid: rand::thread_rng().gen::<i32>(),
+    // },
+    // 2 => Request::Connect {
+    // cid: PROTOCOL_ID,
+    // action: 0_i32,
+    // tid: rand::thread_rng().gen::<i32>(),
+    // },
+    // }
+    // }
 }
 
-#[derive(Debug, Clone)]
-pub struct ConnectReq {
-    pub cid: i64,
-    pub action: i32,
-    pub tid: i32,
+impl Response {
+    pub fn to_response(v: &[u8]) -> Result<Self, Report> {
+        match v[3] {
+            0 => Ok(Response::Connect {
+                action: i32::from_be_bytes(v[0..4].try_into()?),
+                tid: i32::from_be_bytes(v[4..8].try_into()?),
+                cid: i64::from_be_bytes(v[8..16].try_into()?),
+            }),
+            1 => {
+                let peers = match v.len() {
+                    n if n < 20 => Vec::new(),
+                    _ => v[20..]
+                        .chunks(6)
+                        .map(|x| {
+                            SocketAddr::new(
+                                IpAddr::V4(Ipv4Addr::new(x[0], x[1], x[2], x[3])),
+                                u16::from_be_bytes(x[4..6].try_into().unwrap()),
+                            )
+                        })
+                        .collect(),
+                };
+
+                Ok(Response::Announce {
+                    action: i32::from_be_bytes(v[0..4].try_into()?),
+                    tid: i32::from_be_bytes(v[4..8].try_into()?),
+                    interval: i32::from_be_bytes(v[8..12].try_into()?),
+                    leechers: i32::from_be_bytes(v[12..16].try_into()?),
+                    seeders: i32::from_be_bytes(v[16..20].try_into()?),
+                    peers,
+                })
+            }
+            2 => {
+                let n = v[8..].len() / (std::mem::size_of::<i32>() * 3);
+
+                Ok(Response::Scrape {
+                    action: i32::from_be_bytes(v[0..4].try_into()?),
+                    tid: i32::from_be_bytes(v[4..8].try_into()?),
+                    hashes: v[8..]
+                        .chunks(n)
+                        .map(|x| Status {
+                            complete: i32::from_be_bytes(x[0..4].try_into().unwrap()),
+                            downloaded: i32::from_be_bytes(x[4..8].try_into().unwrap()),
+                            incomplete: i32::from_be_bytes(x[8..12].try_into().unwrap()),
+                        })
+                        .collect(),
+                })
+            }
+            _ => Ok(Response::Error {
+                action: i32::from_be_bytes(v[0..4].try_into()?),
+                tid: i32::from_be_bytes(v[4..8].try_into()?),
+                error: std::str::from_utf8(&v[8..])?.to_owned(),
+            }),
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct ConnectResp {
-    pub action: i32,
-    pub tid: i32,
-    pub cid: i64,
+impl Request {
+    pub fn to_request(&self) -> Vec<u8> {
+        match self {
+            Request::Connect { cid, action, tid } => [
+                cid.to_be_bytes().to_vec(),
+                [action.to_be_bytes(), tid.to_be_bytes()].concat(),
+            ]
+            .concat(),
+            Request::Announce {
+                cid,
+                action,
+                tid,
+                hash,
+                peer_id,
+                downloaded,
+                left,
+                uploaded,
+                event,
+                socket,
+                key,
+                num_want,
+                extensions,
+            } => {
+                [
+                    cid.to_be_bytes().to_vec(),
+                    action.to_be_bytes().to_vec(),
+                    tid.to_be_bytes().to_vec(),
+                    hash.to_vec(),
+                    peer_id.to_vec(),
+                    downloaded.to_be_bytes().to_vec(),
+                    left.to_be_bytes().to_vec(),
+                    uploaded.to_be_bytes().to_vec(),
+                    [0, 0, 0, 0].to_vec(),
+                    [0, 0, 0, 0].to_vec(),
+                    key.to_be_bytes().to_vec(),
+                    num_want.to_be_bytes().to_vec(),
+                    1317u16.to_be_bytes().to_vec(),
+                    // self.extensions.to_be_bytes().to_vec(),
+                ]
+                .concat()
+            }
+            Request::Scrape {
+                cid,
+                action,
+                tid,
+                hashes,
+            } => [
+                cid.to_be_bytes().as_slice(),
+                action.to_be_bytes().as_slice(),
+                tid.to_be_bytes().as_slice(),
+                &hashes.iter().flat_map(|v| v.to_vec()).collect::<Vec<_>>(),
+            ]
+            .concat(),
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct AnnounceReq {
-    pub cid: i64,
-    pub action: i32,
-    pub tid: i32,
-    pub hash: [u8; 20],
-    pub peer_id: [u8; 20],
-    pub downloaded: i64,
-    pub left: i64,
-    pub uploaded: i64,
-    pub event: Event,
-    pub socket: SocketAddr,
-    pub key: u32,
-    pub num_want: i32,
-    pub extensions: u16,
-}
-
-#[derive(Debug, Clone)]
-pub struct AnnounceResp {
-    pub action: i32,
-    pub tid: i32,
-    pub interval: i32,
-    pub leechers: i32,
-    pub seeders: i32,
-    pub peers: Vec<SocketAddr>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ScrapeReq {
-    pub cid: i64,
-    pub action: i32,
-    pub tid: i32,
-    pub hashes: Vec<[u8; 20]>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ScrapeResp {
-    pub action: i32,
-    pub tid: i32,
-    pub hashes: Vec<Status>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Status {
     complete: i32,
     downloaded: i32,
@@ -93,185 +255,9 @@ pub struct Status {
 }
 
 #[derive(Debug, Clone)]
-pub struct TrackerError {
-    action: i32,
-    tid: i32,
-    pub error: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum Event {
+pub enum TransferEvent {
     Inactive = 0,
     Completed,
     Started,
     Stopped,
-}
-
-impl ConnectReq {
-    pub fn build() -> Self {
-        Self {
-            cid: PROTOCOL_ID,
-            action: 0_i32,
-            tid: rand::thread_rng().gen::<i32>(),
-        }
-    }
-}
-
-impl Request for ConnectReq {
-    fn to_request(&self) -> Vec<u8> {
-        [
-            self.cid.to_be_bytes().to_vec(),
-            [self.action.to_be_bytes(), self.tid.to_be_bytes()].concat(),
-        ]
-        .concat()
-    }
-}
-
-impl Response for ConnectResp {
-    fn to_response(v: &[u8]) -> Result<Self, Report> {
-        Ok(Self {
-            action: i32::from_be_bytes(v[0..4].try_into()?),
-            tid: i32::from_be_bytes(v[4..8].try_into()?),
-            cid: i64::from_be_bytes(v[8..16].try_into()?),
-        })
-    }
-}
-
-impl AnnounceReq {
-    pub fn build(magnet: MagnetInfo, cid: i64, peer_id: [u8; 20], key: u32) -> Self {
-        Self {
-            cid,
-            action: 1i32,
-            tid: rand::thread_rng().gen::<i32>(),
-            hash: decode(magnet.hash),
-            peer_id,
-            downloaded: 0,
-            left: 0,
-            uploaded: 0,
-            event: Event::Inactive,
-            socket: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
-            key,
-            num_want: -1i32,
-            extensions: 0u16,
-        }
-    }
-}
-
-impl Request for AnnounceReq {
-    fn to_request(&self) -> Vec<u8> {
-        let ok = [
-            self.cid.to_be_bytes().to_vec(),
-            self.action.to_be_bytes().to_vec(),
-            self.tid.to_be_bytes().to_vec(),
-            self.hash.to_vec(),
-            self.peer_id.to_vec(),
-            self.downloaded.to_be_bytes().to_vec(),
-            self.left.to_be_bytes().to_vec(),
-            self.uploaded.to_be_bytes().to_vec(),
-            [0, 0, 0, 0].to_vec(),
-            [0, 0, 0, 0].to_vec(),
-            self.key.to_be_bytes().to_vec(),
-            self.num_want.to_be_bytes().to_vec(),
-            1317u16.to_be_bytes().to_vec(),
-            // self.extensions.to_be_bytes().to_vec(),
-        ];
-        debug!(?ok);
-
-        ok.concat()
-    }
-}
-
-impl Response for AnnounceResp {
-    fn to_response(v: &[u8]) -> Result<Self, Report>
-    where
-        Self: Sized,
-    {
-        let peers = match v.len() {
-            n if n < 20 => Vec::new(),
-            _ => v[20..]
-                .chunks(6)
-                .map(|x| {
-                    SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(x[0], x[1], x[2], x[3])),
-                        u16::from_be_bytes(x[4..6].try_into().unwrap()),
-                    )
-                })
-                .collect(),
-        };
-
-        Ok(Self {
-            // 0, 0, 0, 0
-            action: i32::from_be_bytes(v[0..4].try_into()?),
-            // 240, 23, 226, 211
-            tid: i32::from_be_bytes(v[4..8].try_into()?),
-            // 117, 26, 194, 111
-            interval: i32::from_be_bytes(v[8..12].try_into()?),
-            // 6, 180, 52, 126
-            leechers: i32::from_be_bytes(v[12..16].try_into()?),
-            seeders: i32::from_be_bytes(v[16..20].try_into()?),
-            peers,
-        })
-    }
-}
-
-impl ScrapeReq {
-    pub fn build(cid: i64, magnet: MagnetInfo) -> Self {
-        Self {
-            cid,
-            action: 2i32,
-            tid: rand::thread_rng().gen::<i32>(),
-            hashes: vec![decode(magnet.hash)],
-        }
-    }
-}
-
-impl Request for ScrapeReq {
-    fn to_request(&self) -> Vec<u8> {
-        [
-            self.cid.to_be_bytes().as_slice(),
-            self.action.to_be_bytes().as_slice(),
-            self.tid.to_be_bytes().as_slice(),
-            &self
-                .hashes
-                .iter()
-                .flat_map(|v| v.to_vec())
-                .collect::<Vec<_>>(),
-        ]
-        .concat()
-    }
-}
-
-impl Response for ScrapeResp {
-    fn to_response(v: &[u8]) -> Result<Self, Report>
-    where
-        Self: Sized,
-    {
-        let n = v[8..].len() / (std::mem::size_of::<i32>() * 3);
-
-        Ok(Self {
-            action: i32::from_be_bytes(v[0..4].try_into()?),
-            tid: i32::from_be_bytes(v[4..8].try_into()?),
-            hashes: v[8..]
-                .chunks(n)
-                .map(|x| Status {
-                    complete: i32::from_be_bytes(x[0..4].try_into().unwrap()),
-                    downloaded: i32::from_be_bytes(x[4..8].try_into().unwrap()),
-                    incomplete: i32::from_be_bytes(x[8..12].try_into().unwrap()),
-                })
-                .collect(),
-        })
-    }
-}
-
-impl Response for TrackerError {
-    fn to_response(v: &[u8]) -> Result<Self, Report>
-    where
-        Self: Sized,
-    {
-        Ok(Self {
-            action: i32::from_be_bytes(v[0..4].try_into()?),
-            tid: i32::from_be_bytes(v[4..8].try_into()?),
-            error: std::str::from_utf8(&v[8..])?.to_owned(),
-        })
-    }
 }

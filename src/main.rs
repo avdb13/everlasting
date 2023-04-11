@@ -1,9 +1,9 @@
 #![feature(try_blocks)]
 
 use async_convert::{async_trait, TryFrom};
+use router::Router;
 
 use crate::app::App;
-use crate::udp::{AnnounceReq, ConnectResp, Event};
 use app::Action;
 
 use color_eyre::Report;
@@ -19,9 +19,8 @@ use once_cell::sync::OnceCell;
 
 use rand::Rng;
 
-use router::{Announced, Connected, Disconnected, Router};
 use tokio::time::sleep;
-use udp::{AnnounceResp, Response};
+use udp::Response;
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -54,7 +53,6 @@ pub mod udp;
 pub mod writer;
 
 use crate::helpers::*;
-use crate::udp::ConnectReq;
 
 pub struct HttpRequest {
     hash: [u8; 20],
@@ -77,6 +75,8 @@ pub enum GeneralError {
     Timeout,
     #[error("reconnect")]
     Reconnect,
+    #[error("unexpected response: {0:?}")]
+    UnexpectedResponse(Response),
 }
 
 const PROTOCOL_ID: i64 = 0x41727101980;
@@ -122,23 +122,9 @@ async fn main() -> Result<(), Report> {
     let src = "0.0.0.0:1317".parse()?;
     let socket = Arc::new(UdpSocket::bind(src).await?);
 
-    let router: Router<Disconnected> = Router::new(src, magnet, socket);
-
-    //     enable_raw_mode()?;
-    //     execute!(&mut io::stdout(), EnterAlternateScreen)?;
-
-    let router: Router<Connected> = <Router<router::Connected> as async_convert::TryFrom<
-        Router<Disconnected>,
-    >>::try_from(router)
-    .await?;
-
-    let router =
-        <Router<router::Announced> as async_convert::TryFrom<Router<Connected>>>::try_from(router)
-            .await?;
-
-    let router =
-        <Router<router::Scraped> as async_convert::TryFrom<Router<Announced>>>::try_from(router)
-            .await?;
+    let router: Router = Router::new(src, magnet, socket);
+    let router = router.next(router::Event::Connect).await?;
+    let router = router.next(router::Event::Announce).await?;
 
     // let backend = CrosstermBackend::new(io::stdout());
     // let mut term = Terminal::new(backend)?;
