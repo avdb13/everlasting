@@ -10,6 +10,7 @@ anyhow = { version = "1.0.66", features = ["backtrace"] }
 async-convert = "1.0.0"
 async-trait = "0.1.68"
 bendy = "0.3.3"
+bytes = "1.4.0"
 chrono = "0.4.24"
 color-eyre = "0.6.2"
 crossterm = "0.26.1"

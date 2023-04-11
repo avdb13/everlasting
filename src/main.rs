@@ -1,7 +1,8 @@
 #![feature(try_blocks)]
 
 use async_convert::{async_trait, TryFrom};
-use router::Router;
+use peer::PeerRouter;
+use router::{Router, State};
 
 use crate::app::App;
 use app::Action;
@@ -46,6 +47,7 @@ pub mod app;
 pub mod bencode;
 pub mod data;
 pub mod helpers;
+pub mod peer;
 pub mod router;
 pub mod scrape;
 pub mod state;
@@ -104,13 +106,7 @@ async fn main() -> Result<(), Report> {
     // let clone = writer.clone();
 
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .without_time()
-                .with_level(false)
-                .with_target(false)
-                .with_ansi(false), // .with_writer(move || clone.clone()),
-        )
+        .with(tracing_subscriber::fmt::layer().without_time())
         .init();
 
     let mut s = std::fs::File::open("magnet")?;
@@ -122,9 +118,14 @@ async fn main() -> Result<(), Report> {
     let src = "0.0.0.0:1317".parse()?;
     let socket = Arc::new(UdpSocket::bind(src).await?);
 
-    let router: Router = Router::new(src, magnet, socket);
+    let router: Router = Router::new(src, magnet.clone(), socket);
     let router = router.next(router::Event::Connect).await?;
     let router = router.next(router::Event::Announce).await?;
+
+    if let State::Announced { peers, .. } = router.state {
+        let r = PeerRouter::new(magnet.clone(), peers);
+        r.next().await?;
+    }
 
     // let backend = CrosstermBackend::new(io::stdout());
     // let mut term = Terminal::new(backend)?;

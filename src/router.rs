@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use color_eyre::Report;
 use either::Either;
 use futures::{
-    future::{self, BoxFuture},
+    future::{self, select_ok, BoxFuture},
     FutureExt,
 };
 use once_cell::sync::OnceCell;
@@ -42,7 +42,7 @@ pub struct Router {
 #[derive(Clone, Debug)]
 pub enum State {
     Disconnected,
-    Connected { trackers: Vec<SocketAddr>, cid: i64 },
+    Connected { trackers: Vec<(SocketAddr, i64)> },
     Announced { peers: Vec<SocketAddr>, cid: i64 },
     Scraped,
 }
@@ -105,16 +105,21 @@ impl Router {
             };
         }
 
+        if size == 0 {
+            return Err(GeneralError::DeadTrackers.into());
+        }
+
         debug!("received {size} bytes: {:?}", &data[..size]);
 
         Response::to_response(&data[..size])
     }
 
-    pub async fn try_tracker(&self, s: String) -> Result<(Response, SocketAddr), Report> {
+    pub async fn try_tracker(&self, s: String) -> Result<(SocketAddr, i64), Report> {
+        let tid = rand::thread_rng().gen::<i32>();
         let packet = Request::Connect {
             cid: PROTOCOL_ID,
             action: 0_i32,
-            tid: rand::thread_rng().gen::<i32>(),
+            tid,
         };
 
         let url: Url = Url::parse(&s)?;
@@ -126,9 +131,10 @@ impl Router {
             .next()
             .ok_or::<Report>(GeneralError::InvalidTracker(s).into())?;
 
-        self.dispatch(packet, 3, 4, dst)
-            .await
-            .map(|resp| (resp, dst))
+        match self.dispatch(packet, 3, 1, dst).await? {
+            Response::Connect { cid, .. } => Ok((dst, cid)),
+            _ => Err(GeneralError::DeadTrackers.into()),
+        }
     }
 
     pub fn next(self, event: Event) -> BoxFuture<'static, Result<Self, Report>> {
@@ -142,7 +148,8 @@ impl Router {
                         .iter()
                         .map(|s| Box::pin(self.try_tracker(s.to_owned())));
 
-                    let ((resp, dst), _) = future::select_ok(iter).await?;
+                    let resps = future::join_all(iter).await;
+                    let trackers: Vec<_> = resps.into_iter().filter_map(|x| x.ok()).collect();
 
                     // let resp = match resp {
                     //     r if r.action == 0i32 && r.tid == packet.tid => {
@@ -153,19 +160,13 @@ impl Router {
                     //     _ => return Err(GeneralError::DeadTrackers.into()),
                     // };
 
-                    match resp {
-                        Response::Connect { cid, .. } => Ok(Self {
-                            src: self.src,
-                            dst: Some(dst),
-                            magnet: self.magnet,
-                            socket: self.socket,
-                            state: State::Connected {
-                                cid,
-                                trackers: vec![dst],
-                            },
-                        }),
-                        x => Err(GeneralError::UnexpectedResponse(x).into()),
-                    }
+                    Ok(Self {
+                        src: self.src,
+                        dst: self.dst,
+                        magnet: self.magnet,
+                        socket: self.socket,
+                        state: State::Connected { trackers },
+                    })
                 }
                 // (State::Connected { trackers, cid }, Event::Connect) => {
                 //     let ok = Self {
@@ -178,58 +179,69 @@ impl Router {
 
                 //     Ok(ok.next(Event::Announce).await?)
                 // }
-                (State::Connected { cid, .. }, Event::Announce) => {
+                (State::Connected { trackers }, Event::Announce) => {
                     let peer_id = rand::thread_rng().gen::<[u8; 20]>();
                     let key = rand::thread_rng().gen::<u32>();
 
-                    let packet = Request::Announce {
-                        cid,
-                        action: 1i32,
-                        tid: rand::thread_rng().gen::<i32>(),
-                        hash: decode(self.magnet.hash.clone()),
-                        peer_id,
-                        downloaded: 0,
-                        left: 0,
-                        uploaded: 0,
-                        event: TransferEvent::Inactive,
-                        socket: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0),
-                        key,
-                        num_want: -1i32,
-                        extensions: 0u16,
-                    };
+                    let iter = trackers.iter().map(|&(dst, cid)| {
+                        let router = self.clone();
 
-                    let resp = self
-                        .dispatch(packet.clone(), 3, 4, self.dst.unwrap())
-                        .await?;
-
-                    match resp {
-                        Response::Announce { peers, .. } => {
-                            debug!(?peers);
-
-                            Ok(Self {
-                                state: State::Announced { peers, cid },
-                                magnet: self.magnet,
-                                dst: self.dst,
-                                src: self.src,
-                                socket: self.socket,
-                            })
-                        }
-                        Response::Connect { cid, .. } => {
-                            let new = Self {
-                                state: State::Connected {
-                                    trackers: vec![self.dst.unwrap()],
+                        Box::pin({
+                            async move {
+                                let packet = Request::Announce {
                                     cid,
-                                },
-                                magnet: self.magnet,
-                                dst: self.dst,
-                                src: self.src,
-                                socket: self.socket,
-                            };
+                                    action: 1i32,
+                                    tid: rand::thread_rng().gen::<i32>(),
+                                    hash: decode(router.magnet.hash.clone()),
+                                    peer_id,
+                                    downloaded: 0,
+                                    left: 0,
+                                    uploaded: 0,
+                                    event: TransferEvent::Inactive,
+                                    socket: SocketAddr::new(
+                                        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+                                        0,
+                                    ),
+                                    key,
+                                    num_want: -1i32,
+                                    extensions: 0u16,
+                                };
 
-                            new.next(Event::Announce).await
-                        }
-                        x => Err(GeneralError::UnexpectedResponse(x).into()),
-                    }
+                                let resp = router.dispatch(packet.clone(), 3, 4, dst).await?;
+
+                                match resp {
+                                    Response::Announce { peers, .. } => {
+                                        debug!(?peers);
+
+                                        Ok(Self {
+                                            state: State::Announced { peers, cid },
+                                            magnet: router.magnet,
+                                            dst: router.dst,
+                                            src: router.src,
+                                            socket: router.socket,
+                                        })
+                                    }
+                                    // Response::Connect { cid, .. } => {
+                                    // let new = Self {
+                                    //     state: State::Connected {
+                                    //         trackers: vec![router.dst.unwrap()],
+                                    //         cid,
+                                    //     },
+                                    //     magnet: router.magnet,
+                                    //     dst: router.dst,
+                                    //     src: router.src,
+                                    //     socket: router.socket,
+                                    // };
+
+                                    // new.next(Event::Announce).await
+                                    // }
+                                    x => Err(GeneralError::UnexpectedResponse(x).into()),
+                                }
+                            }
+                        })
+                    });
+
+                    select_ok(iter).await.map(|(x, _)| x)
                 }
                 (State::Announced { peers, cid }, Event::Connect) => todo!(),
                 (State::Announced { peers, cid }, Event::Announce) => todo!(),

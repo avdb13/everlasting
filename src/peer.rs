@@ -1,8 +1,13 @@
+use bytes::BytesMut;
 use std::{net::SocketAddr, sync::Arc};
 
 use color_eyre::Report;
-use tokio::net::UdpSocket;
-use tracing::debug;
+use rand::Rng;
+use tokio::{
+    io::{split, AsyncReadExt, AsyncWriteExt},
+    net::{TcpStream, UdpSocket},
+};
+use tracing::{debug, field::debug};
 
 use crate::{
     helpers::{decode, MagnetInfo},
@@ -19,19 +24,37 @@ impl Torrent {
 }
 
 pub struct PeerRouter {
-    torrent: MagnetInfo,
+    magnet: MagnetInfo,
     peers: Vec<SocketAddr>,
 }
 
 impl PeerRouter {
-    pub fn new(torrent: MagnetInfo, peers: Vec<SocketAddr>) -> Self {
-        PeerRouter { torrent, peers }
+    pub async fn next(&self) -> Result<(), Report> {
+        let pid = rand::thread_rng().gen::<[u8; 20]>();
+        let stream = TcpStream::connect(self.peers[0]).await?;
+        let (mut rx, mut tx) = split(stream);
+
+        let handshake = Handshake::new(decode(self.magnet.hash.clone()), pid);
+        debug!(?handshake);
+
+        tokio::spawn(async move {
+            let mut buf = BytesMut::with_capacity(1024);
+            while let Ok(n) = rx.read_buf(&mut buf).await {
+                debug!("{:?}", &buf[..n]);
+            }
+        });
+        tx.write_all(&handshake.to_request()).await?;
+
+        Ok(())
+    }
+    pub fn new(magnet: MagnetInfo, peers: Vec<SocketAddr>) -> Self {
+        PeerRouter { magnet, peers }
     }
 
     pub async fn broadcast(&self, peer_id: [u8; 20]) -> Result<(), Report> {
         let socket = Arc::new(UdpSocket::bind("0.0.0.0:6969").await?);
 
-        let handshake = Handshake::new(decode(self.torrent.hash.clone()), peer_id);
+        let handshake = Handshake::new(decode(self.magnet.hash.clone()), peer_id);
 
         let iter = self.peers.iter().map(|p| {
             Box::pin({
@@ -61,7 +84,7 @@ impl PeerRouter {
         let ok = futures::future::join_all(iter).await;
 
         // loop {
-        //     while !torrent.finished() {}
+        //     while !magnet.finished() {}
         // }
         Ok(())
     }
@@ -75,10 +98,9 @@ pub struct Client {
 }
 
 // the peer id will presumably be sent after the recipient sends its own handshake
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Handshake {
     pstr: String,
-    reserved: [u8; 8],
     hash: [u8; 20],
     peer_id: [u8; 20],
 }
@@ -112,8 +134,7 @@ pub enum Message {
 impl Handshake {
     fn new(hash: [u8; 20], peer_id: [u8; 20]) -> Self {
         Self {
-            pstr: "Bittorrent protocol".to_owned(),
-            reserved: [0u8; 8],
+            pstr: "Bitmagnet protocol".to_owned(),
             hash,
             peer_id,
         }
