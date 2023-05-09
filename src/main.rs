@@ -1,8 +1,7 @@
 #![feature(try_blocks)]
 
-use async_convert::{async_trait, TryFrom};
 use peer::PeerRouter;
-use router::{Router, State};
+use router::{Router, State, Tracker};
 
 use crate::app::App;
 use app::Action;
@@ -14,7 +13,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 
-use data::File;
+use data::{File, SocketResponse};
 use futures_util::future;
 use once_cell::sync::OnceCell;
 
@@ -50,60 +49,16 @@ pub mod helpers;
 pub mod peer;
 pub mod router;
 pub mod scrape;
+pub mod socket;
 pub mod state;
 pub mod udp;
 pub mod writer;
 
 use crate::helpers::*;
 
-pub struct HttpRequest {
-    hash: [u8; 20],
-    id: [u8; 20],
-    port: u16,
-    uploaded: u64,
-    downloaded: u64,
-    compact: bool,
-}
-
-#[derive(Error, Debug)]
-pub enum GeneralError {
-    #[error("usage: everlasting [torrent file | magnet link]")]
-    Usage,
-    #[error("magnet link contains no valid trackers: `{0:?}`")]
-    InvalidTracker(String),
-    #[error("no active trackers for this torrent")]
-    DeadTrackers,
-    #[error("timeout")]
-    Timeout,
-    #[error("reconnect")]
-    Reconnect,
-    #[error("unexpected response: {0:?}")]
-    UnexpectedResponse(Response),
-}
-
-const PROTOCOL_ID: i64 = 0x41727101980;
-
-fn reset_terminal() -> Result<(), Report> {
-    disable_raw_mode()?;
-    crossterm::execute!(io::stdout(), LeaveAlternateScreen)?;
-
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Report> {
     color_eyre::install()?;
-
-    let panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        reset_terminal().unwrap();
-        panic(info)
-    }));
-
-    let (tx_stdout, rx_stdout): (UnboundedSender<String>, UnboundedReceiver<String>) =
-        unbounded_channel();
-    let writer = Writer::new(tx_stdout);
-    // let clone = writer.clone();
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer().without_time())
@@ -115,17 +70,21 @@ async fn main() -> Result<(), Report> {
 
     let magnet = magnet_decoder(std::str::from_utf8(&buf)?)?;
 
-    let src = "0.0.0.0:1317".parse()?;
+    let (tx, rx): (mpsc::Sender<SocketResponse>, mpsc::Receiver<SocketResponse>) =
+        mpsc::channel(magnet.trackers.len());
+    let src: SocketAddr = "0.0.0.0:1317".parse()?;
     let socket = Arc::new(UdpSocket::bind(src).await?);
 
-    let router: Router = Router::new(src, magnet.clone(), socket);
-    let router = router.next(router::Event::Connect).await?;
-    let router = router.next(router::Event::Announce).await?;
+    Tracker::new(magnet, src);
 
-    if let State::Announced { peers, .. } = router.state {
-        let r = PeerRouter::new(magnet.clone(), peers);
-        r.next().await?;
-    }
+    // router.socket.dispatch(packet, timeout_n, retries, dst);
+
+    // let router = router.next(router::Event::Announce).await?;
+
+    // if let State::Announced { peers, .. } = router.state {
+    //     let r = PeerRouter::new(magnet.clone(), peers);
+    //     r.next().await?;
+    // }
 
     // let backend = CrosstermBackend::new(io::stdout());
     // let mut term = Terminal::new(backend)?;

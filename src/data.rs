@@ -1,3 +1,29 @@
+use std::net::SocketAddr;
+
+use thiserror::Error;
+
+use crate::udp::Response;
+
+pub type SocketResponse = (Response, SocketAddr);
+
+#[derive(Error, Debug)]
+pub enum GeneralError {
+    #[error("usage: everlasting [torrent file | magnet link]")]
+    Usage,
+    #[error("magnet link contains no valid trackers: `{0:?}`")]
+    InvalidTracker(String),
+    #[error("no active trackers for this torrent")]
+    DeadTrackers,
+    #[error("timeout")]
+    Timeout,
+    #[error("reconnect")]
+    Reconnect,
+    #[error("unexpected response: {0:?}")]
+    UnexpectedResponse(Response),
+}
+
+pub const PROTOCOL_ID: i64 = 0x41727101980;
+
 #[derive(Default, Debug, Eq, PartialEq)]
 pub struct Metadata {
     pub info: Info,
@@ -94,4 +120,13 @@ impl Default for Mode {
     fn default() -> Self {
         Mode::Single(SingleInfo::default())
     }
+}
+
+pub struct HttpRequest {
+    hash: [u8; 20],
+    id: [u8; 20],
+    port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    compact: bool,
 }

@@ -1,456 +1,221 @@
-use std::{
-    io::ErrorKind,
-    net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
-    sync::Arc,
-    time::Duration,
-};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
 
-use async_convert::{async_trait, TryFrom};
-use chrono::{DateTime, Utc};
 use color_eyre::Report;
-use either::Either;
-use futures::{
-    future::{self, select_ok, BoxFuture},
-    FutureExt,
-};
-use once_cell::sync::OnceCell;
+use dashmap::DashMap;
+use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
 use rand::Rng;
-use reqwest::Url;
 use tokio::{
     net::UdpSocket,
-    sync::mpsc::Receiver,
-    time::{sleep, timeout},
+    sync::watch::{channel, Receiver, Sender},
+    task::JoinSet,
 };
 use tracing::debug;
 
 use crate::{
-    helpers::{decode, MagnetInfo},
+    data::{GeneralError, PROTOCOL_ID},
+    helpers::MagnetInfo,
     udp::{Request, Response, TransferEvent},
-    GeneralError, PROTOCOL_ID,
 };
 
-#[derive(Clone, Debug)]
-pub struct Router {
-    pub state: State,
-    pub magnet: MagnetInfo,
-    pub socket: Arc<UdpSocket>,
+pub type Message = (SocketAddr, Response);
 
-    src: SocketAddr,
-    dst: Option<SocketAddr>,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum State {
     Disconnected,
-    Connected { trackers: Vec<(SocketAddr, i64)> },
+    Connected { cid: i64 },
     Announced { peers: Vec<SocketAddr>, cid: i64 },
     Scraped,
 }
 
-#[derive(Debug)]
-pub enum Event {
-    Connect,
-    Announce,
+pub struct Tracker {
+    trackers: DashMap<SocketAddr, Session>,
+    socket: Arc<UdpSocket>,
+    tx: Sender<Option<Message>>,
+
+    hash: [u8; 20],
 }
 
-impl Router {
-    pub fn new(src: SocketAddr, magnet: MagnetInfo, socket: Arc<UdpSocket>) -> Self {
+impl Tracker {
+    pub fn new(magnet: MagnetInfo, src: SocketAddr) -> Result<Self, Report> {
+        let socket = std::net::UdpSocket::bind(src)?;
+        let socket = Arc::new(UdpSocket::from_std(socket)?);
+
+        let (tx, rx) = channel(None::<Message>);
+
+        let trackers = magnet
+            .trackers
+            .iter()
+            .map(|&s| {
+                (
+                    s,
+                    Session::new(magnet.hash.clone(), s, socket.clone(), rx.clone()),
+                )
+            })
+            .collect();
+
+        Ok(Self {
+            trackers,
+            tx,
+            hash: magnet.hash,
+            socket,
+        })
+    }
+
+    pub async fn run(&mut self) -> Result<Vec<Option<Session>>, Report> {
+        let f = self
+            .trackers
+            .iter_mut()
+            .map(|mut session| async move { session.next().await.ok() })
+            .collect::<FuturesUnordered<_>>();
+
+        // let g =
+
+        Ok(f.collect().await)
+    }
+
+    pub async fn listen(&self) {
+        loop {
+            let mut buf = [0u8; 1024];
+            match self.socket.recv_from(&mut buf).await {
+                Ok((n, peer)) => {
+                    let resp = Response::to_response(&buf[..n]).unwrap();
+                    self.tx.send(Some((peer, resp))).unwrap();
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("{}", e),
+            }
+        }
+    }
+}
+
+pub struct Session {
+    pub state: State,
+    pub rx: Receiver<Option<Message>>,
+    pub socket: Arc<UdpSocket>,
+    pub dst: SocketAddr,
+    pub hash: [u8; 20],
+
+    pub retries: usize,
+    pub timeout: usize,
+}
+
+impl Session {
+    pub fn new(
+        hash: [u8; 20],
+        dst: SocketAddr,
+        socket: Arc<UdpSocket>,
+        rx: Receiver<Option<Message>>,
+    ) -> Self {
         Self {
-            src,
-            dst: None,
-            magnet,
+            rx,
             socket,
             state: State::Disconnected,
+            dst,
+            hash,
+            retries: 3,
+            timeout: 5,
         }
     }
 
-    pub async fn dispatch(
-        &self,
-        packet: Request,
-        timeout_n: u64,
-        retries: usize,
-        dst: SocketAddr,
-    ) -> Result<Response, Report> {
-        let mut data = [0; 1024 * 100];
-        let mut size = 0;
-
-        for _ in 0..retries {
-            match self.socket.send_to(&packet.to_request(), dst).await {
+    pub async fn dispatch(&mut self, packet: Request) -> Result<Response, Report> {
+        for _ in 0..self.retries {
+            match self.socket.send_to(&packet.to_request(), self.dst).await {
                 Ok(n) => {
-                    debug!("sent {n} bytes: {:?}", &packet.to_request()[..n]);
+                    debug!("socket sent {n} bytes: {:?}", &packet.to_request()[..n]);
+
+                    let resp = loop {
+                        let tmp = &*self.rx.borrow();
+
+                        match tmp {
+                            Some((s, resp)) if s == &self.dst => {
+                                break resp.clone();
+                            }
+                            _ => {
+                                continue;
+                            }
+                        }
+                    };
+
+                    self.rx.borrow_and_update();
+                    debug!("socket received response: {:?}", resp);
+
+                    return Ok(resp);
                 }
                 Err(e) => match e.kind() {
                     ErrorKind::WouldBlock => continue,
                     _ => return Err(e.into()),
                 },
             }
-
-            match timeout(
-                Duration::from_secs(timeout_n),
-                self.socket.recv(&mut data[..]),
-            )
-            .await
-            {
-                Ok(r) => match r {
-                    Ok(n) => {
-                        debug!("found working tracker: {:?}", dst.clone());
-                        size = n;
-                        break;
-                    }
-                    Err(e) => return Err(e.into()),
-                },
-                Err(_) => {
-                    debug!("did not receive value within {timeout_n} seconds");
-                }
-            };
         }
 
-        if size == 0 {
-            return Err(GeneralError::DeadTrackers.into());
-        }
-
-        debug!("received {size} bytes: {:?}", &data[..size]);
-
-        Response::to_response(&data[..size])
+        Err(GeneralError::InvalidTracker(self.dst.to_string()).into())
     }
 
-    pub async fn try_tracker(&self, s: String) -> Result<(SocketAddr, i64), Report> {
-        let tid = rand::thread_rng().gen::<i32>();
-        let packet = Request::Connect {
-            cid: PROTOCOL_ID,
-            action: 0_i32,
-            tid,
-        };
-
-        let url: Url = Url::parse(&s)?;
-        debug!("[TRACKERS] trying {} as tracker ...", s);
-
-        let (addr, port) = (url.host_str().unwrap(), url.port().unwrap());
-        let dst = (addr, port)
-            .to_socket_addrs()?
-            .next()
-            .ok_or::<Report>(GeneralError::InvalidTracker(s).into())?;
-
-        match self.dispatch(packet, 3, 1, dst).await? {
-            Response::Connect { cid, .. } => Ok((dst, cid)),
-            _ => Err(GeneralError::DeadTrackers.into()),
-        }
-    }
-
-    pub fn next(self, event: Event) -> BoxFuture<'static, Result<Self, Report>> {
-        debug!(?event, ?self);
+    pub fn next(mut self) -> BoxFuture<'static, Result<Self, Report>> {
         async move {
-            match (self.clone().state, event) {
-                (State::Disconnected, Event::Connect) => {
-                    let iter = self
-                        .magnet
-                        .trackers
-                        .iter()
-                        .map(|s| Box::pin(self.try_tracker(s.to_owned())));
+            match self.state {
+                State::Disconnected => {
+                    let tid = rand::thread_rng().gen::<i32>();
+                    let packet = Request::Connect {
+                        cid: PROTOCOL_ID,
+                        action: 0_i32,
+                        tid,
+                    };
 
-                    let resps = future::join_all(iter).await;
-                    let trackers: Vec<_> = resps.into_iter().filter_map(|x| x.ok()).collect();
-
-                    // let resp = match resp {
-                    //     r if r.action == 0i32 && r.tid == packet.tid => {
-                    //         debug!("transaction ID matches: {:?}", packet.tid.to_be_bytes());
-                    //         debug!("connection ID is {:?}", r.cid.to_be_bytes());
-                    //         r
-                    //     }
-                    //     _ => return Err(GeneralError::DeadTrackers.into()),
-                    // };
-
-                    Ok(Self {
-                        src: self.src,
-                        dst: self.dst,
-                        magnet: self.magnet,
-                        socket: self.socket,
-                        state: State::Connected { trackers },
-                    })
+                    let resp = self.dispatch(packet).await?;
+                    if let Response::Connect { cid, .. } = resp {
+                        self.state = State::Connected { cid };
+                        self.next().await
+                    } else {
+                        Err(GeneralError::Timeout.into())
+                    }
                 }
-                // (State::Connected { trackers, cid }, Event::Connect) => {
-                //     let ok = Self {
-                //         src: self.src,
-                //         dst: None,
-                //         magnet: self.magnet,
-                //         socket: self.socket,
-                //         state: State::Connected { trackers, cid },
-                //     };
-
-                //     Ok(ok.next(Event::Announce).await?)
-                // }
-                (State::Connected { trackers }, Event::Announce) => {
+                State::Connected { cid } => {
                     let peer_id = rand::thread_rng().gen::<[u8; 20]>();
                     let key = rand::thread_rng().gen::<u32>();
 
-                    let iter = trackers.iter().map(|&(dst, cid)| {
-                        let router = self.clone();
+                    let packet = Request::Announce {
+                        cid,
+                        action: 1i32,
+                        tid: rand::thread_rng().gen::<i32>(),
+                        hash: self.hash,
+                        peer_id,
+                        downloaded: 0,
+                        left: 0,
+                        uploaded: 0,
+                        event: TransferEvent::Inactive,
+                        socket: self.socket.local_addr()?,
+                        key,
+                        num_want: -1i32,
+                        extensions: 0u16,
+                    };
 
-                        Box::pin({
-                            async move {
-                                let packet = Request::Announce {
-                                    cid,
-                                    action: 1i32,
-                                    tid: rand::thread_rng().gen::<i32>(),
-                                    hash: decode(router.magnet.hash.clone()),
-                                    peer_id,
-                                    downloaded: 0,
-                                    left: 0,
-                                    uploaded: 0,
-                                    event: TransferEvent::Inactive,
-                                    socket: SocketAddr::new(
-                                        IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-                                        0,
-                                    ),
-                                    key,
-                                    num_want: -1i32,
-                                    extensions: 0u16,
-                                };
+                    let resp = self.dispatch(packet).await?;
 
-                                let resp = router.dispatch(packet.clone(), 3, 4, dst).await?;
-
-                                match resp {
-                                    Response::Announce { peers, .. } => {
-                                        debug!(?peers);
-
-                                        Ok(Self {
-                                            state: State::Announced { peers, cid },
-                                            magnet: router.magnet,
-                                            dst: router.dst,
-                                            src: router.src,
-                                            socket: router.socket,
-                                        })
-                                    }
-                                    // Response::Connect { cid, .. } => {
-                                    // let new = Self {
-                                    //     state: State::Connected {
-                                    //         trackers: vec![router.dst.unwrap()],
-                                    //         cid,
-                                    //     },
-                                    //     magnet: router.magnet,
-                                    //     dst: router.dst,
-                                    //     src: router.src,
-                                    //     socket: router.socket,
-                                    // };
-
-                                    // new.next(Event::Announce).await
-                                    // }
-                                    x => Err(GeneralError::UnexpectedResponse(x).into()),
-                                }
-                            }
-                        })
-                    });
-
-                    select_ok(iter).await.map(|(x, _)| x)
+                    match resp {
+                        Response::Connect { cid, .. } => {
+                            self.state = State::Connected { cid };
+                            self.next().await
+                        }
+                        Response::Announce { peers, .. } => {
+                            self.state = State::Announced { peers, cid };
+                            self.next().await
+                        }
+                        _ => {
+                            panic!()
+                        }
+                    }
                 }
-                (State::Announced { peers, cid }, Event::Connect) => todo!(),
-                (State::Announced { peers, cid }, Event::Announce) => todo!(),
-                (State::Scraped, Event::Connect) => todo!(),
-                (State::Scraped, Event::Announce) => todo!(),
-                _ => panic!(),
+                State::Announced { .. } => return Ok(self),
+                State::Scraped => todo!(),
             }
         }
         .boxed()
     }
 }
 
-// #[async_trait]
-// impl TryFrom<Router<Connected>> for Router<Announced> {
-//     type Error = Report;
-
-//     async fn try_from(old: Router<Connected>) -> Result<Router<Announced>, Self::Error> {
-//         let peer_id = rand::thread_rng().gen::<[u8; 20]>();
-//         let key = rand::thread_rng().gen::<u32>();
-
-//         let packet = AnnounceReq::build(old.magnet.clone(), old.state.cid, peer_id, key);
-
-//         let mut ok = old.announce(old.dst.unwrap(), packet.clone()).await?;
-
-//         loop {
-//             match ok[3] {
-//                 0 => {
-//                     let resp = ConnectResp::to_response(&ok)?;
-//                     let packet = AnnounceReq::build(old.magnet.clone(), resp.cid, peer_id, key);
-//                     debug!(?resp.cid);
-
-//                     ok = old.announce(old.state.trackers[0], packet.clone()).await?;
-//                 }
-//                 3 => {
-//                     let resp = TrackerError::to_response(&ok)?;
-//                     debug!(resp.error);
-//                     break;
-//                 }
-//                 _ => {
-//                     break;
-//                 }
-//             }
-//             sleep(Duration::from_millis(500)).await;
-//         }
-
-//         let resp = AnnounceResp::to_response(&ok)?;
-
-//         Ok(Self {
-//             state: Announced {
-//                 peers: resp.peers,
-//                 cid: old.state.cid,
-//             },
-//             magnet: old.magnet,
-//             dst: old.dst,
-//             src: old.src,
-//             socket: old.socket,
-//         })
-//     }
-// }
-
-// #[async_trait]
-// impl TryFrom<Router<Announced>> for Router<Scraped> {
-//     type Error = Report;
-
-//     async fn try_from(old: Router<Announced>) -> Result<Router<Scraped>, Self::Error> {
-//         let packet = ScrapeReq::build(old.state.cid, old.magnet.clone());
-
-//         let resp = old.scrape(old.dst.unwrap(), packet).await?;
-
-//         debug!(?resp);
-
-//         Ok(Self {
-//             state: Scraped {},
-//             magnet: old.magnet,
-//             dst: old.dst,
-//             src: old.src,
-//             socket: old.socket,
-//         })
-//     }
-// }
-
-pub type RoutingTable = Vec<Node>;
-
-pub struct Node {
-    pub id: [u8; 20],
-    pub routing_table: RoutingTable,
+#[derive(Clone, Debug)]
+pub enum Event {
+    Connect,
+    Announce,
 }
-
-pub struct Bucket {
-    last_changed: DateTime<Utc>,
-}
-
-impl Node {
-    fn compare(&self, _hash: [u8; 20]) -> [u8; 20] {
-        todo!()
-    }
-}
-
-// impl<S> Router<S> {
-//     pub async fn connect(
-//         &self,
-//         dst: SocketAddr,
-//         packet: ConnectReq,
-//     ) -> Result<(SocketAddr, ConnectResp), Report> {
-//         let mut data = [0; 1024 * 100];
-//         let mut size = 0;
-
-//         for _ in 0..4 {
-//             match self.socket.send_to(&packet.to_request(), dst).await {
-//                 Ok(n) => {
-//                     debug!(
-//                         "[CONNECT] sent {n} bytes: ({:?}) {:?}",
-//                         std::any::type_name::<ConnectReq>(),
-//                         &packet.to_request()[..n]
-//                     );
-//                 }
-//                 Err(e) => match e.kind() {
-//                     ErrorKind::WouldBlock => continue,
-//                     _ => return Err(e.into()),
-//                 },
-//             }
-
-//             match timeout(Duration::from_secs(15), self.socket.recv(&mut data[..])).await {
-//                 Err(_) => {
-//                     debug!("[CONNECT] did not receive value within 15 seconds");
-//                 }
-//                 Ok(r) => match r {
-//                     Ok(n) => {
-//                         debug!("[CONNECT] found working tracker: {:?}", dst.clone());
-//                         size = n;
-//                         break;
-//                     }
-//                     Err(e) => return Err(e.into()),
-//                 },
-//             };
-//         }
-
-//         debug!(
-//             "[CONNECT] received {size} bytes: ({:?}) {:?}",
-//             std::any::type_name::<ConnectResp>(),
-//             &data[..size]
-//         );
-
-//         ConnectResp::to_response(&data[..size]).map(|ok| (dst, ok))
-//     }
-
-//     pub async fn announce(&self, dst: SocketAddr, packet: AnnounceReq) -> Result<Vec<u8>, Report> {
-//         let mut resp = [0; 1024 * 100];
-
-//         match self.socket.send_to(&packet.to_request(), dst).await {
-//             Ok(n) => {
-//                 debug!(
-//                     "[ANNOUNCE] sent {n} bytes: ({:?})",
-//                     std::any::type_name::<AnnounceReq>(),
-//                     // &packet.to_request(),
-//                 );
-//             }
-//             Err(e) => {
-//                 return Err(e.into());
-//             }
-//         }
-//         let n = match timeout(Duration::from_secs(3), self.socket.recv(&mut resp[..])).await {
-//             Err(_) => {
-//                 debug!("[ANNOUNCE] did not receive value within 3 seconds");
-//                 return Err(GeneralError::Timeout.into());
-//             }
-//             Ok(r) => match r {
-//                 Ok(n) => n,
-//                 Err(e) => return Err(e.into()),
-//             },
-//         };
-
-//         debug!(
-//             "[ANNOUNCE] received {n} bytes: ({:?}) {:?}",
-//             std::any::type_name::<AnnounceResp>(),
-//             &resp[..n]
-//         );
-
-//         Ok(resp[..n].to_vec())
-//     }
-
-//     pub async fn scrape(&self, dst: SocketAddr, packet: ScrapeReq) -> Result<ScrapeResp, Report> {
-//         let mut resp = [0; 1024 * 100];
-
-//         match self.socket.send_to(&packet.to_request(), dst).await {
-//             Ok(n) => {
-//                 debug!(
-//                     "[SCRAPE] sent {n} bytes: ({:?})",
-//                     std::any::type_name::<ScrapeReq>(),
-//                     // &packet.to_request(),
-//                 );
-//             }
-//             Err(e) => {
-//                 return Err(e.into());
-//             }
-//         }
-
-//         let n = match self.socket.recv(&mut resp[..]).await {
-//             Ok(n) => n,
-//             Err(e) => return Err(e.into()),
-//         };
-
-//         debug!(
-//             "[SCRAPE] received {n} bytes: ({:?}) {:?}",
-//             std::any::type_name::<ScrapeReq>(),
-//             &resp[..n]
-//         );
-
-//         ScrapeResp::to_response(&resp[..n])
-//     }
-// }
-//

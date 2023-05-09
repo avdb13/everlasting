@@ -1,8 +1,13 @@
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    net::{SocketAddr, ToSocketAddrs},
+};
 
 use color_eyre::Report;
 use tracing::debug;
 use url::Url;
+
+use crate::data::GeneralError;
 
 pub fn prettier(s: String) -> String {
     s.chars()
@@ -42,9 +47,9 @@ pub fn encode(arr: &[u8]) -> String {
 
 #[derive(Clone, Default, Debug)]
 pub struct MagnetInfo {
-    pub hash: String,
+    pub hash: [u8; 20],
     pub name: String,
-    pub trackers: Vec<String>,
+    pub trackers: Vec<SocketAddr>,
 }
 
 pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
@@ -57,10 +62,18 @@ pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
             // "xt", "dn", "xl", "tr", "ws", "as", "xs", "kt", "mt", "so", "x.pe",
             ("xt", s) => {
                 let url = s.split(':').last().unwrap();
-                info.hash = url.to_owned();
+                info.hash = decode(url.to_owned());
             }
             ("tr", s) => {
-                info.trackers.push(s);
+                let url: Url = Url::parse(&s)?;
+
+                let (addr, port) = (url.host_str().unwrap(), url.port().unwrap());
+                let dst = (addr, port)
+                    .to_socket_addrs()?
+                    .next()
+                    .ok_or::<Report>(GeneralError::InvalidTracker(s.clone()).into())?;
+
+                info.trackers.push(dst);
             }
             ("dn", s) => {
                 info.name = s;

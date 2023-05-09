@@ -7,10 +7,7 @@ use color_eyre::Report;
 use rand::Rng;
 use tracing::debug;
 
-use crate::{
-    helpers::{decode, MagnetInfo},
-    GeneralError, PROTOCOL_ID,
-};
+use crate::helpers::{decode, MagnetInfo};
 
 #[derive(Clone)]
 pub enum Request {
@@ -42,7 +39,7 @@ pub enum Request {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Response {
     Connect {
         action: i32,
@@ -247,7 +244,7 @@ impl Request {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Status {
     complete: i32,
     downloaded: i32,
