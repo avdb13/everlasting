@@ -4,6 +4,7 @@ use std::{
 };
 
 use color_eyre::Report;
+use rand::seq::SliceRandom;
 use tracing::debug;
 use url::Url;
 
@@ -83,5 +84,6 @@ pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
     }
     debug!(?info.hash);
 
+    info.trackers.shuffle(&mut rand::thread_rng());
     Ok(info)
 }

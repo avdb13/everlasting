@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
 use color_eyre::Report;
 use dashmap::DashMap;
@@ -8,6 +8,7 @@ use tokio::{
     net::UdpSocket,
     sync::watch::{channel, Receiver, Sender},
     task::JoinSet,
+    time::{sleep, timeout},
 };
 use tracing::debug;
 
@@ -28,58 +29,62 @@ pub enum State {
 }
 
 pub struct Tracker {
-    trackers: DashMap<SocketAddr, Session>,
-    socket: Arc<UdpSocket>,
-    tx: Sender<Option<Message>>,
+    pub trackers: DashMap<SocketAddr, Session>,
+    pub socket: Arc<UdpSocket>,
 
-    hash: [u8; 20],
+    pub hash: [u8; 20],
 }
 
 impl Tracker {
-    pub fn new(magnet: MagnetInfo, src: SocketAddr) -> Result<Self, Report> {
-        let socket = std::net::UdpSocket::bind(src)?;
-        let socket = Arc::new(UdpSocket::from_std(socket)?);
-
-        let (tx, rx) = channel(None::<Message>);
-
+    pub fn new(
+        magnet: MagnetInfo,
+        socket: Arc<UdpSocket>,
+        rx: Receiver<Option<Message>>,
+    ) -> Result<Self, Report> {
         let trackers = magnet
             .trackers
             .iter()
-            .map(|&s| {
-                (
-                    s,
-                    Session::new(magnet.hash.clone(), s, socket.clone(), rx.clone()),
-                )
-            })
+            .map(|&s| (s, Session::new(magnet.hash, s, socket.clone(), rx.clone())))
             .collect();
 
         Ok(Self {
             trackers,
-            tx,
             hash: magnet.hash,
             socket,
         })
     }
 
-    pub async fn run(&mut self) -> Result<Vec<Option<Session>>, Report> {
-        let f = self
-            .trackers
-            .iter_mut()
-            .map(|mut session| async move { session.next().await.ok() })
-            .collect::<FuturesUnordered<_>>();
+    pub async fn run(self) -> Result<Vec<SocketAddr>, Report> {
+        let mut set = JoinSet::new();
+        let len = self.trackers.len();
+        let mut working = Vec::with_capacity(len);
 
-        // let g =
+        self.trackers.into_iter().for_each(|(ip, session)| {
+            debug!("resolver spawned for [{}]", ip);
+            set.spawn(session.resolve());
+        });
 
-        Ok(f.collect().await)
+        let mut i = 0;
+        while let Some(f) = set.join_next().await {
+            i += 1;
+            debug!("hello rust: {} ({})", i, len);
+            working.push(f?);
+        }
+
+        debug!("hello rust finished");
+
+        Ok(working.into_iter().flatten().flatten().collect())
     }
 
-    pub async fn listen(&self) {
+    pub async fn listen(socket: Arc<UdpSocket>, tx: Sender<Option<Message>>) {
         loop {
             let mut buf = [0u8; 1024];
-            match self.socket.recv_from(&mut buf).await {
+            match socket.clone().recv_from(&mut buf).await {
                 Ok((n, peer)) => {
                     let resp = Response::to_response(&buf[..n]).unwrap();
-                    self.tx.send(Some((peer, resp))).unwrap();
+                    debug!("listener received value: {:?}", &resp);
+
+                    tx.send(Some((peer, resp))).unwrap();
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
                 Err(e) => panic!("{}", e),
@@ -117,11 +122,15 @@ impl Session {
         }
     }
 
-    pub async fn dispatch(&mut self, packet: Request) -> Result<Response, Report> {
+    pub async fn dispatch(
+        &self,
+        packet: Request,
+        mut rx: Receiver<Option<Message>>,
+    ) -> Result<Response, Report> {
         for _ in 0..self.retries {
             match self.socket.send_to(&packet.to_request(), self.dst).await {
-                Ok(n) => {
-                    debug!("socket sent {n} bytes: {:?}", &packet.to_request()[..n]);
+                Ok(_) => {
+                    debug!("socket [{}] sent request: {:?}", self.dst.ip(), &packet);
 
                     let resp = loop {
                         let tmp = &*self.rx.borrow();
@@ -136,8 +145,9 @@ impl Session {
                         }
                     };
 
-                    self.rx.borrow_and_update();
-                    debug!("socket received response: {:?}", resp);
+                    rx.borrow_and_update();
+
+                    debug!("socket [{}] received response: {:?}", self.dst.ip(), resp,);
 
                     return Ok(resp);
                 }
@@ -151,66 +161,64 @@ impl Session {
         Err(GeneralError::InvalidTracker(self.dst.to_string()).into())
     }
 
-    pub fn next(mut self) -> BoxFuture<'static, Result<Self, Report>> {
-        async move {
-            match self.state {
-                State::Disconnected => {
-                    let tid = rand::thread_rng().gen::<i32>();
-                    let packet = Request::Connect {
-                        cid: PROTOCOL_ID,
-                        action: 0_i32,
-                        tid,
-                    };
+    // TODO: make this recursive
+    pub async fn connect(&self) -> Result<Response, Report> {
+        let tid = rand::thread_rng().gen::<i32>();
+        let packet = Request::Connect {
+            cid: PROTOCOL_ID,
+            action: 0_i32,
+            tid,
+        };
 
-                    let resp = self.dispatch(packet).await?;
-                    if let Response::Connect { cid, .. } = resp {
-                        self.state = State::Connected { cid };
-                        self.next().await
-                    } else {
-                        Err(GeneralError::Timeout.into())
+        timeout(
+            Duration::from_secs(3),
+            self.dispatch(packet, self.rx.clone()),
+        )
+        .await?
+    }
+
+    pub async fn announce(&self, cid: i64) -> Result<Response, Report> {
+        let peer_id = rand::thread_rng().gen::<[u8; 20]>();
+        let key = rand::thread_rng().gen::<u32>();
+
+        let packet = Request::Announce {
+            cid,
+            action: 1i32,
+            tid: rand::thread_rng().gen::<i32>(),
+            hash: self.hash,
+            peer_id,
+            downloaded: 0,
+            left: 0,
+            uploaded: 0,
+            event: TransferEvent::Inactive,
+            socket: self.socket.local_addr().unwrap(),
+            key,
+            num_want: -1i32,
+            extensions: 0u16,
+        };
+
+        timeout(
+            Duration::from_secs(3),
+            self.dispatch(packet, self.rx.clone()),
+        )
+        .await?
+    }
+    pub async fn resolve(self) -> Option<Vec<SocketAddr>> {
+        if let Response::Connect { cid, .. } = self.connect().await.ok()? {
+            for _ in 0..self.retries {
+                match self.announce(cid).await.ok()? {
+                    Response::Connect { action, tid, cid } => {
+                        // sleep(Duration::from_secs(1)).await;
+                        continue;
                     }
+                    Response::Announce { peers, .. } => return Some(peers),
+                    _ => return None,
                 }
-                State::Connected { cid } => {
-                    let peer_id = rand::thread_rng().gen::<[u8; 20]>();
-                    let key = rand::thread_rng().gen::<u32>();
-
-                    let packet = Request::Announce {
-                        cid,
-                        action: 1i32,
-                        tid: rand::thread_rng().gen::<i32>(),
-                        hash: self.hash,
-                        peer_id,
-                        downloaded: 0,
-                        left: 0,
-                        uploaded: 0,
-                        event: TransferEvent::Inactive,
-                        socket: self.socket.local_addr()?,
-                        key,
-                        num_want: -1i32,
-                        extensions: 0u16,
-                    };
-
-                    let resp = self.dispatch(packet).await?;
-
-                    match resp {
-                        Response::Connect { cid, .. } => {
-                            self.state = State::Connected { cid };
-                            self.next().await
-                        }
-                        Response::Announce { peers, .. } => {
-                            self.state = State::Announced { peers, cid };
-                            self.next().await
-                        }
-                        _ => {
-                            panic!()
-                        }
-                    }
-                }
-                State::Announced { .. } => return Ok(self),
-                State::Scraped => todo!(),
             }
+            None
+        } else {
+            None
         }
-        .boxed()
     }
 }
 

@@ -18,8 +18,8 @@ pub enum GeneralError {
     Timeout,
     #[error("reconnect")]
     Reconnect,
-    #[error("unexpected response: {0:?}")]
-    UnexpectedResponse(Response),
+    #[error("unexpected response: {0}")]
+    UnexpectedResponse(String),
 }
 
 pub const PROTOCOL_ID: i64 = 0x41727101980;

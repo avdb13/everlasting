@@ -9,7 +9,7 @@ use tracing::debug;
 
 use crate::helpers::{decode, MagnetInfo};
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Request {
     Connect {
         cid: i64,
