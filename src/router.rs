@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
 use color_eyre::Report;
 use dashmap::DashMap;
@@ -6,7 +6,7 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt}
 use rand::Rng;
 use tokio::{
     net::UdpSocket,
-    sync::watch::{channel, Receiver, Sender},
+    sync::mpsc::{self, Receiver, Sender},
     task::JoinSet,
     time::{sleep, timeout},
 };
@@ -37,14 +37,17 @@ pub struct Tracker {
 
 impl Tracker {
     pub fn new(
-        magnet: MagnetInfo,
+        magnet: &MagnetInfo,
         socket: Arc<UdpSocket>,
-        rx: Receiver<Option<Message>>,
+        mut rx: HashMap<SocketAddr, Receiver<Response>>,
     ) -> Result<Self, Report> {
         let trackers = magnet
             .trackers
             .iter()
-            .map(|&s| (s, Session::new(magnet.hash, s, socket.clone(), rx.clone())))
+            .map(|&s| {
+                let rx = rx.remove(&s).unwrap();
+                (s, Session::new(magnet.hash, s, socket.clone(), rx))
+            })
             .collect();
 
         Ok(Self {
@@ -64,19 +67,14 @@ impl Tracker {
             set.spawn(session.resolve());
         });
 
-        let mut i = 0;
         while let Some(f) = set.join_next().await {
-            i += 1;
-            debug!("hello rust: {} ({})", i, len);
             working.push(f?);
         }
-
-        debug!("hello rust finished");
 
         Ok(working.into_iter().flatten().flatten().collect())
     }
 
-    pub async fn listen(socket: Arc<UdpSocket>, tx: Sender<Option<Message>>) {
+    pub async fn listen(socket: Arc<UdpSocket>, tx: HashMap<SocketAddr, Sender<Response>>) {
         loop {
             let mut buf = [0u8; 1024];
             match socket.clone().recv_from(&mut buf).await {
@@ -84,7 +82,8 @@ impl Tracker {
                     let resp = Response::to_response(&buf[..n]).unwrap();
                     debug!("listener received value: {:?}", &resp);
 
-                    tx.send(Some((peer, resp))).unwrap();
+                    let tx = tx.get(&peer).unwrap();
+                    tx.send(resp).await.unwrap();
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
                 Err(e) => panic!("{}", e),
@@ -95,7 +94,7 @@ impl Tracker {
 
 pub struct Session {
     pub state: State,
-    pub rx: Receiver<Option<Message>>,
+    pub rx: Receiver<Response>,
     pub socket: Arc<UdpSocket>,
     pub dst: SocketAddr,
     pub hash: [u8; 20],
@@ -109,12 +108,12 @@ impl Session {
         hash: [u8; 20],
         dst: SocketAddr,
         socket: Arc<UdpSocket>,
-        rx: Receiver<Option<Message>>,
+        rx: Receiver<Response>,
     ) -> Self {
         Self {
+            state: State::Disconnected,
             rx,
             socket,
-            state: State::Disconnected,
             dst,
             hash,
             retries: 3,
@@ -122,30 +121,13 @@ impl Session {
         }
     }
 
-    pub async fn dispatch(
-        &self,
-        packet: Request,
-        mut rx: Receiver<Option<Message>>,
-    ) -> Result<Response, Report> {
+    pub async fn dispatch(&mut self, packet: Request) -> Result<Response, Report> {
         for _ in 0..self.retries {
             match self.socket.send_to(&packet.to_request(), self.dst).await {
                 Ok(_) => {
                     debug!("socket [{}] sent request: {:?}", self.dst.ip(), &packet);
 
-                    let resp = loop {
-                        let tmp = &*self.rx.borrow();
-
-                        match tmp {
-                            Some((s, resp)) if s == &self.dst => {
-                                break resp.clone();
-                            }
-                            _ => {
-                                continue;
-                            }
-                        }
-                    };
-
-                    rx.borrow_and_update();
+                    let resp = self.rx.recv().await.ok_or(GeneralError::Timeout)?;
 
                     debug!("socket [{}] received response: {:?}", self.dst.ip(), resp,);
 
@@ -162,7 +144,7 @@ impl Session {
     }
 
     // TODO: make this recursive
-    pub async fn connect(&self) -> Result<Response, Report> {
+    pub async fn connect(&mut self) -> Result<Response, Report> {
         let tid = rand::thread_rng().gen::<i32>();
         let packet = Request::Connect {
             cid: PROTOCOL_ID,
@@ -170,14 +152,10 @@ impl Session {
             tid,
         };
 
-        timeout(
-            Duration::from_secs(3),
-            self.dispatch(packet, self.rx.clone()),
-        )
-        .await?
+        timeout(Duration::from_secs(3), self.dispatch(packet)).await?
     }
 
-    pub async fn announce(&self, cid: i64) -> Result<Response, Report> {
+    pub async fn announce(&mut self, cid: i64) -> Result<Response, Report> {
         let peer_id = rand::thread_rng().gen::<[u8; 20]>();
         let key = rand::thread_rng().gen::<u32>();
 
@@ -197,13 +175,9 @@ impl Session {
             extensions: 0u16,
         };
 
-        timeout(
-            Duration::from_secs(3),
-            self.dispatch(packet, self.rx.clone()),
-        )
-        .await?
+        timeout(Duration::from_secs(3), self.dispatch(packet)).await?
     }
-    pub async fn resolve(self) -> Option<Vec<SocketAddr>> {
+    pub async fn resolve(mut self) -> Option<Vec<SocketAddr>> {
         if let Response::Connect { cid, .. } = self.connect().await.ok()? {
             for _ in 0..self.retries {
                 match self.announce(cid).await.ok()? {

@@ -24,6 +24,10 @@ pub fn prettier(s: String) -> String {
         .collect()
 }
 
+pub fn range_to_array<const N: usize>(v: &[u8]) -> [u8; N] {
+    core::array::from_fn::<u8, N, _>(|i| v[i])
+}
+
 pub fn decode(s: String) -> [u8; 20] {
     let v: Vec<_> = s.chars().collect();
     let v = v
@@ -66,14 +70,7 @@ pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
                 info.hash = decode(url.to_owned());
             }
             ("tr", s) => {
-                let url: Url = Url::parse(&s)?;
-
-                let (addr, port) = (url.host_str().unwrap(), url.port().unwrap());
-                let dst = (addr, port)
-                    .to_socket_addrs()?
-                    .next()
-                    .ok_or::<Report>(GeneralError::InvalidTracker(s.clone()).into())?;
-
+                let dst = udp_address_to_ip(&s).ok_or(GeneralError::InvalidTracker(s))?;
                 info.trackers.push(dst);
             }
             ("dn", s) => {
@@ -86,4 +83,11 @@ pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
 
     info.trackers.shuffle(&mut rand::thread_rng());
     Ok(info)
+}
+
+pub fn udp_address_to_ip(s: &str) -> Option<SocketAddr> {
+    let url: Url = Url::parse(&s).ok()?;
+
+    let (addr, port) = (url.host_str()?, url.port()?);
+    (addr, port).to_socket_addrs().ok()?.next()
 }

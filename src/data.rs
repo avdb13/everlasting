@@ -23,6 +23,7 @@ pub enum GeneralError {
 }
 
 pub const PROTOCOL_ID: i64 = 0x41727101980;
+pub const SHA1_LEN: usize = 20;
 
 #[derive(Default, Debug, Eq, PartialEq)]
 pub struct Metadata {
@@ -38,23 +39,33 @@ pub struct Metadata {
 pub struct Info {
     pub mode: Mode,
     pub piece_length: u64,
-    pub pieces: Vec<u8>,
+    pub pieces: Vec<[u8; SHA1_LEN]>,
     pub private: Option<()>,
-    pub value: Vec<u8>,
+    pub value: [u8; 20],
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
-pub struct SingleInfo {
-    pub name: String,
-    pub length: u64,
-    pub md5sum: Option<Vec<u8>>,
+#[derive(Debug, PartialEq, Eq)]
+pub enum Mode {
+    Single {
+        name: String,
+        length: u64,
+        md5sum: Option<Vec<u8>>,
+    },
+    Multi {
+        dir_name: String,
+        files: Vec<File>,
+        md5sum: Option<Vec<u8>>,
+    },
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
-pub struct MultiInfo {
-    pub dir_name: String,
-    pub files: Vec<File>,
-    pub md5sum: Option<Vec<u8>>,
+impl Default for Mode {
+    fn default() -> Self {
+        Mode::Single {
+            length: 0,
+            name: Default::default(),
+            md5sum: None,
+        }
+    }
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -110,21 +121,9 @@ pub struct Status {
     pub name: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum Mode {
-    Single(SingleInfo),
-    Multi(MultiInfo),
-}
-
-impl Default for Mode {
-    fn default() -> Self {
-        Mode::Single(SingleInfo::default())
-    }
-}
-
 pub struct HttpRequest {
-    hash: [u8; 20],
-    id: [u8; 20],
+    hash: [u8; SHA1_LEN],
+    id: [u8; SHA1_LEN],
     port: u16,
     uploaded: u64,
     downloaded: u64,

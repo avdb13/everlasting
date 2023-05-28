@@ -143,8 +143,9 @@ impl Response {
                 let peers = match v.len() {
                     n if n < 20 => Vec::new(),
                     _ => v[20..]
-                        .chunks(6)
+                        .chunks_exact(6)
                         .map(|x| {
+                            debug!(?x);
                             SocketAddr::new(
                                 IpAddr::V4(Ipv4Addr::new(x[0], x[1], x[2], x[3])),
                                 u16::from_be_bytes(x[4..6].try_into().unwrap()),

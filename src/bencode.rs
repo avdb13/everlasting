@@ -1,13 +1,271 @@
 use hex::FromHex;
 
-
 use bendy::decoding::{Decoder, FromBencode, Object};
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
+use tracing::debug;
 
-use crate::data::{
-    File, HttpResponse, Info, Metadata, Mode, MultiInfo, Peer, ScrapeResponse, SingleInfo, Status,
+use crate::{
+    data::{File, HttpResponse, Info, Metadata, Mode, Peer, ScrapeResponse, Status, SHA1_LEN},
+    helpers::range_to_array,
 };
+
+impl FromBencode for Metadata {
+    const EXPECTED_RECURSION_DEPTH: usize = 5;
+
+    fn decode_bencode_object(
+        object: bendy::decoding::Object,
+    ) -> Result<Self, bendy::decoding::Error>
+    where
+        Self: Sized,
+    {
+        let mut dict = object.try_into_dictionary()?;
+        let mut md = Metadata::default();
+
+        while let Some(pair) = dict.next_pair()? {
+            match pair {
+                (b"info", _) => {
+                    if let Object::Dict(dd) = pair.1 {
+                        let bytes = dd.into_raw()?;
+                        let mut hasher = Sha1::new();
+
+                        hasher.input(bytes);
+
+                        let hash = <[u8; 20]>::from_hex(hasher.result_str())?;
+
+                        let mut dec = Decoder::new(bytes);
+                        let info = Info::decode_bencode_object(dec.next_object()?.unwrap())?;
+
+                        md.info = info;
+                        md.info.value = hash;
+                    }
+                }
+                (b"announce", _) => {
+                    let s = String::decode_bencode_object(pair.1)?;
+                    debug!(?s);
+                    md.announce = s;
+                }
+                (b"announce-list", list) => {
+                    let mut v: Vec<Vec<String>> = Vec::new();
+                    let mut list = list.try_into_list()?;
+
+                    while let Some(list) = list.next_object()? {
+                        let mut list = list.try_into_list()?;
+
+                        let mut w = Vec::new();
+
+                        while let Some(s) = list.next_object()? {
+                            let s = String::decode_bencode_object(s)?;
+                            if s.starts_with("udp") {
+                                w.push(s);
+                            }
+                        }
+
+                        v.push(w);
+                    }
+
+                    md.announce_list = Some(v);
+                }
+                (b"creation date", _) => {
+                    let i = u64::decode_bencode_object(pair.1)?;
+                    md.created = Some(i);
+                }
+                (b"comment", _) => {
+                    let s = String::decode_bencode_object(pair.1)?;
+                    md.comment = s;
+                }
+                (b"created by", _) => {
+                    let s = String::decode_bencode_object(pair.1)?;
+                    md.author = Some(s);
+                }
+
+                (b"piece length", _) => {
+                    let i = u64::decode_bencode_object(pair.1)?;
+                    dbg!("piece length: {}", i);
+                    md.info.piece_length = i;
+                }
+                (b"pieces", _) => {
+                    let pieces = pair.1.try_into_bytes()?;
+                    dbg!(&pieces.len());
+                    let pieces: Vec<_> = pieces
+                        .chunks(pieces.len() / SHA1_LEN)
+                        .map(|x| range_to_array(&x[0..=20]))
+                        .collect();
+                    dbg!(&pieces.len());
+                    md.info.pieces = pieces;
+                }
+                (b"nodes", _) => {
+                    let mut list = pair.1.try_into_list()?;
+
+                    while let Some(x) = list.next_object()? {
+                        let mut x = x.try_into_list()?;
+
+                        let fst = x.next_object()?;
+                        let _fst = String::decode_bencode_object(fst.unwrap()).unwrap();
+
+                        let snd = x.next_object()?;
+                        let _snd = u64::decode_bencode_object(snd.unwrap()).unwrap();
+                    }
+                }
+                _ => {
+                    let _s = String::decode_bencode_object(pair.1)?;
+                }
+            }
+        }
+        Ok(md)
+    }
+}
+
+impl FromBencode for Info {
+    const EXPECTED_RECURSION_DEPTH: usize = 5;
+
+    fn decode_bencode_object(
+        object: bendy::decoding::Object,
+    ) -> Result<Self, bendy::decoding::Error>
+    where
+        Self: Sized,
+    {
+        let mut info = Info::default();
+
+        let mut dict = object.try_into_dictionary()?;
+        while let Some(pair) = dict.next_pair()? {
+            if let (b"files", _) = pair {
+                info.mode = Mode::Multi {
+                    dir_name: Default::default(),
+                    files: Default::default(),
+                    md5sum: Default::default(),
+                };
+            }
+        }
+
+        // Decoder -> Object -> DictDecoder
+        let mut dict = Decoder::new(dict.into_raw()?);
+        let dict = dict.next_object()?.unwrap();
+        let mut dict = dict.try_into_dictionary()?;
+
+        let mode: Mode = match info.mode {
+            Mode::Multi {
+                mut dir_name,
+                mut files,
+                mut md5sum,
+            } => {
+                while let Some(pair) = dict.next_pair()? {
+                    dbg!(&std::str::from_utf8(pair.0).unwrap());
+                    match pair {
+                        (b"piece length", _) => {
+                            let i = u64::decode_bencode_object(pair.1)?;
+                            dbg!("piece length: {}", i);
+                            info.piece_length = i;
+                        }
+                        (b"pieces", _) => {
+                            let pieces = pair.1.try_into_bytes()?;
+                            dbg!(&pieces.len());
+                            let pieces: Vec<_> = pieces
+                                .chunks(pieces.len() / SHA1_LEN)
+                                .map(|x| range_to_array(&x[0..=20]))
+                                .collect();
+                            dbg!(&pieces, &pieces.len());
+                            info.pieces = pieces;
+                        }
+                        (b"private", _) => {
+                            info.private = Some(());
+                        }
+
+                        (b"name", _) => {
+                            dir_name = String::decode_bencode_object(pair.1).unwrap();
+                        }
+                        (b"files", list) => {
+                            let mut files: Vec<File> = Vec::new();
+                            let mut list = list.try_into_list()?;
+
+                            while let Some(file) = list.next_object()? {
+                                let mut file = file.try_into_dictionary()?;
+
+                                while let Some(pair) = file.next_pair()? {
+                                    let mut file = File::default();
+
+                                    match pair {
+                                        (b"length", _) => {
+                                            file.length = u64::decode_bencode_object(pair.1)?;
+                                        }
+                                        (b"md5sum", _) => {
+                                            file.md5sum =
+                                                Some(pair.1.try_into_bytes().unwrap().to_vec());
+                                        }
+                                        (b"path", _) => {
+                                            let mut path = pair.1.try_into_list()?;
+                                            while let Some(x) = path.next_object()? {
+                                                let s = String::decode_bencode_object(x)?;
+                                                file.path.push(s);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+
+                                    files.push(file);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                Mode::Multi {
+                    dir_name,
+                    files,
+                    md5sum,
+                }
+            }
+            Mode::Single {
+                mut name,
+                mut length,
+                mut md5sum,
+            } => {
+                while let Some(pair) = dict.next_pair()? {
+                    match pair {
+                        (b"piece length", _) => {
+                            let len = u64::decode_bencode_object(pair.1)?;
+                            dbg!(&len);
+                            info.piece_length = len;
+                        }
+                        (b"pieces", _) => {
+                            let pieces = pair.1.try_into_bytes()?;
+                            let pieces: Vec<_> = pieces
+                                .chunks(SHA1_LEN)
+                                .map(|x| range_to_array(&x[0..20]))
+                                .collect();
+                            dbg!(&pieces.len());
+                            info.pieces = pieces;
+                        }
+                        (b"private", _) => {
+                            info.private = Some(());
+                        }
+                        (b"name", _) => {
+                            name = String::decode_bencode_object(pair.1)?;
+                        }
+                        (b"length", _) => {
+                            length = u64::decode_bencode_object(pair.1)?;
+                        }
+                        (b"md5sum", _) => {
+                            md5sum = Some(pair.1.try_into_bytes()?.to_vec());
+                        }
+                        _ => {}
+                    }
+                }
+
+                Mode::Single {
+                    name,
+                    length,
+                    md5sum,
+                }
+            }
+        };
+
+        info.mode = mode;
+
+        Ok(info)
+    }
+}
 
 impl FromBencode for HttpResponse {
     const EXPECTED_RECURSION_DEPTH: usize = 5;
@@ -23,7 +281,6 @@ impl FromBencode for HttpResponse {
         let mut resp = HttpResponse::default();
 
         while let Some(pair) = dict.next_pair()? {
-            dbg!(&std::str::from_utf8(pair.0).unwrap());
             match pair {
                 (b"failure reason", _) => {
                     let s = String::decode_bencode_object(pair.1)?;
@@ -89,227 +346,6 @@ impl FromBencode for HttpResponse {
     }
 }
 
-impl FromBencode for Info {
-    const EXPECTED_RECURSION_DEPTH: usize = 5;
-
-    fn decode_bencode_object(
-        object: bendy::decoding::Object,
-    ) -> Result<Self, bendy::decoding::Error>
-    where
-        Self: Sized,
-    {
-        let mut mode = Mode::default();
-
-        let mut dict = object.try_into_dictionary()?;
-        while let Some(pair) = dict.next_pair()? {
-            if let (b"files", _) = pair {
-                mode = Mode::Multi(MultiInfo::default());
-            }
-        }
-
-        // Decoder -> Object -> DictDecoder
-        let mut dict = Decoder::new(dict.into_raw()?);
-        let dict = dict.next_object()?.unwrap();
-        let mut dict = dict.try_into_dictionary()?;
-
-        match mode {
-            Mode::Multi(_) => {
-                let mut info = Info::default();
-                let mut multi = MultiInfo::default();
-
-                while let Some(pair) = dict.next_pair()? {
-                    dbg!(&std::str::from_utf8(pair.0).unwrap());
-                    match pair {
-                        (b"piece length", _) => {
-                            info.piece_length = u64::decode_bencode_object(pair.1)?;
-                        }
-                        (b"pieces", _) => {
-                            info.pieces = pair.1.try_into_bytes()?.to_vec();
-                        }
-                        (b"private", _) => {
-                            info.private = Some(());
-                        }
-
-                        (b"name", _) => {
-                            multi.dir_name = String::decode_bencode_object(pair.1).unwrap();
-                        }
-                        (b"files", list) => {
-                            let mut files: Vec<File> = Vec::new();
-                            let mut list = list.try_into_list()?;
-
-                            while let Some(file) = list.next_object()? {
-                                let mut file = file.try_into_dictionary()?;
-
-                                while let Some(pair) = file.next_pair()? {
-                                    let mut file = File::default();
-
-                                    match pair {
-                                        (b"length", _) => {
-                                            file.length = u64::decode_bencode_object(pair.1)?;
-                                        }
-                                        (b"md5sum", _) => {
-                                            file.md5sum =
-                                                Some(pair.1.try_into_bytes().unwrap().to_vec());
-                                        }
-                                        (b"path", _) => {
-                                            let mut path = pair.1.try_into_list()?;
-                                            while let Some(x) = path.next_object()? {
-                                                let s = String::decode_bencode_object(x)?;
-                                                file.path.push(s);
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-
-                                    files.push(file);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                info.mode = Mode::Multi(multi);
-                Ok(info)
-            }
-            Mode::Single(_) => {
-                let mut info = Info::default();
-                let mut single = SingleInfo::default();
-
-                while let Some(pair) = dict.next_pair()? {
-                    dbg!(&std::str::from_utf8(pair.0).unwrap());
-                    match pair {
-                        (b"piece length", _) => {
-                            info.piece_length = u64::decode_bencode_object(pair.1)?;
-                        }
-                        (b"pieces", _) => {
-                            info.pieces = pair.1.try_into_bytes()?.to_vec();
-                        }
-                        (b"private", _) => {
-                            info.private = Some(());
-                        }
-                        (b"name", _) => {
-                            single.name = String::decode_bencode_object(pair.1)?;
-                        }
-                        (b"length", _) => {
-                            single.length = u64::decode_bencode_object(pair.1)?;
-                        }
-                        (b"md5sum", _) => {
-                            single.md5sum = Some(pair.1.try_into_bytes()?.to_vec());
-                        }
-                        _ => {}
-                    }
-                }
-
-                info.mode = Mode::Single(single);
-                Ok(info)
-            }
-        }
-    }
-}
-
-impl FromBencode for Metadata {
-    const EXPECTED_RECURSION_DEPTH: usize = 5;
-
-    fn decode_bencode_object(
-        object: bendy::decoding::Object,
-    ) -> Result<Self, bendy::decoding::Error>
-    where
-        Self: Sized,
-    {
-        let mut dict = object.try_into_dictionary()?;
-        let mut md = Metadata::default();
-
-        while let Some(pair) = dict.next_pair()? {
-            dbg!(&std::str::from_utf8(pair.0).unwrap());
-            match pair {
-                (b"info", _) => {
-                    if let Object::Dict(dd) = pair.1 {
-                        let bytes = dd.into_raw()?;
-                        dbg!(bytes
-                            .iter()
-                            .flat_map(|&x| match x.is_ascii() {
-                                true => Some(x as char),
-                                false => None,
-                            })
-                            .collect::<String>());
-                        let mut hasher = Sha1::new();
-
-                        hasher.input(bytes);
-
-                        let ok = <[u8; 20]>::from_hex(hasher.result_str())?;
-                        dbg!(ok, &ok, &ok.len());
-
-                        let mut dec = Decoder::new(bytes);
-                        let info = Info::decode_bencode_object(dec.next_object()?.unwrap())?;
-
-                        md.info = info;
-                        md.info.value = ok.to_vec();
-                    }
-                }
-                (b"announce", _) => {
-                    let s = String::decode_bencode_object(pair.1)?;
-                    md.announce = s;
-                }
-                (b"announce-list", list) => {
-                    let mut v: Vec<Vec<String>> = Vec::new();
-                    let mut list = list.try_into_list()?;
-
-                    if let Some(list) = list.next_object()? {
-                        let mut list = list.try_into_list()?;
-
-                        let mut w = Vec::new();
-
-                        if let Some(s) = list.next_object()? {
-                            let s = String::decode_bencode_object(s)?;
-                            w.push(s);
-                        }
-
-                        v.push(w);
-                    };
-                }
-                (b"creation date", _) => {
-                    let i = u64::decode_bencode_object(pair.1)?;
-                    md.created = Some(i);
-                }
-                (b"comment", _) => {
-                    let s = String::decode_bencode_object(pair.1)?;
-                    md.comment = s;
-                }
-                (b"created by", _) => {
-                    let s = String::decode_bencode_object(pair.1)?;
-                    md.author = Some(s);
-                }
-
-                (b"piece length", _) => {
-                    let i = u64::decode_bencode_object(pair.1)?;
-                    md.info.piece_length = i;
-                }
-                (b"pieces", _) => {
-                    let pieces = pair.1.try_into_bytes()?;
-                    md.info.pieces = pieces.to_vec();
-                }
-                (b"nodes", _) => {
-                    let mut list = pair.1.try_into_list()?;
-
-                    while let Some(x) = list.next_object()? {
-                        let mut x = x.try_into_list()?;
-
-                        let fst = x.next_object()?;
-                        let _fst = String::decode_bencode_object(fst.unwrap()).unwrap();
-
-                        let snd = x.next_object()?;
-                        let _snd = u64::decode_bencode_object(snd.unwrap()).unwrap();
-                    }
-                }
-                _ => {
-                    let _s = String::decode_bencode_object(pair.1)?;
-                }
-            }
-        }
-        Ok(md)
-    }
-}
-
 impl FromBencode for ScrapeResponse {
     const EXPECTED_RECURSION_DEPTH: usize = 5;
 
@@ -319,8 +355,6 @@ impl FromBencode for ScrapeResponse {
     where
         Self: Sized,
     {
-        // &bytes = b"d5:filesd20:\x1b\x84\xcb\xd2TZf\x8a\xd85\x04!\xd4\x1b\x88\x0f?d\xcc\xf4d8:completei17e10:incompletei2e10:downloadedi1539eeee"
-
         let mut dict = object.try_into_dictionary()?;
         let mut result = Vec::new();
 
@@ -332,7 +366,6 @@ impl FromBencode for ScrapeResponse {
                 let mut status: Status = Default::default();
 
                 while let Some(pair) = decoder.next_pair()? {
-                    dbg!(std::str::from_utf8(pair.0).unwrap());
                     match pair {
                         (b"complete", _) => {
                             status.seeders = u32::decode_bencode_object(pair.1)?;
