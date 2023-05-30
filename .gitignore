@@ -2,3 +2,5 @@ target/
 *.torrent
 to-delete.txt
 /magnet
+peers
+bitfields

@@ -73,23 +73,6 @@ impl Tracker {
 
         Ok(working.into_iter().flatten().flatten().collect())
     }
-
-    pub async fn listen(socket: Arc<UdpSocket>, tx: HashMap<SocketAddr, Sender<Response>>) {
-        loop {
-            let mut buf = [0u8; 1024];
-            match socket.clone().recv_from(&mut buf).await {
-                Ok((n, peer)) => {
-                    let resp = Response::to_response(&buf[..n]).unwrap();
-                    debug!("listener received value: {:?}", &resp);
-
-                    let tx = tx.get(&peer).unwrap();
-                    tx.send(resp).await.unwrap();
-                }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                Err(e) => panic!("{}", e),
-            }
-        }
-    }
 }
 
 pub struct Session {

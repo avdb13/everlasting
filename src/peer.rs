@@ -2,18 +2,12 @@ use bytes::BytesMut;
 use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::mpsc::channel;
 use std::{
-    collections::HashMap,
-    io::ErrorKind,
-    mem::discriminant,
-    net::SocketAddr,
-    sync::{
-        mpsc::{Receiver, Sender},
-        Arc,
-    },
+    collections::HashMap, io::ErrorKind, mem::discriminant, net::SocketAddr, sync::Arc,
     time::Duration,
 };
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::task::JoinHandle;
 
 use color_eyre::Report;
 use rand::Rng;
@@ -33,10 +27,96 @@ use crate::{
     udp::{Request, Response},
 };
 
-pub struct PeerRouter {
+pub struct Router {
     pub magnet: MagnetInfo,
     pub bitfield: Vec<u8>,
     pub peers: HashMap<SocketAddr, Connection>,
+}
+
+impl Router {
+    pub fn new(magnet: MagnetInfo) -> Self {
+        Router {
+            magnet,
+            peers: HashMap::new(),
+            bitfield: Vec::new(),
+        }
+    }
+
+    pub async fn connect(&mut self, peers: Vec<SocketAddr>) -> Result<(), Report> {
+        let peer_id = rand::thread_rng().gen::<[u8; 20]>();
+        let handshake = Handshake::new(self.magnet.hash, peer_id);
+
+        let mut set = JoinSet::new();
+
+        for &s in peers.iter() {
+            set.spawn(Router::handshake(s, handshake.clone()));
+        }
+
+        while let Some(result) = set.join_next().await {
+            match result? {
+                Ok(()) => {
+                    // self.peers.insert(s, Connection::new(writer, rx));
+                }
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
+
+        // for conn in self.peers.values_mut() {
+        //     set.spawn(conn.resolve());
+        // }
+        // while let Some(result) = set.join_next().await {
+        //     match result {
+        //         Ok(_) => todo!(),
+        //         Err(_) => todo!(),
+        //     }
+        // }
+
+        Ok(())
+    }
+
+    pub async fn keep_alive() {
+        loop {
+            sleep(Duration::from_secs(120)).await;
+        }
+    }
+
+    pub async fn handshake(peer: SocketAddr, handshake: Handshake<'_>) -> Result<(), Report> {
+        let mut stream = timeout(Duration::from_secs(3), TcpStream::connect(peer)).await??;
+
+        stream.write_all(&handshake.to_request()).await?;
+        stream.flush().await?;
+        debug!("handshake was sent to {peer:?} ...");
+
+        let mut buf = [0u8; 68];
+
+        match timeout(Duration::from_secs(3), stream.read_exact(&mut buf)).await? {
+            Ok(n) if n != 0 => {
+                let handshake = Handshake::from_response(&buf[..]);
+            }
+            _ => return Err(GeneralError::DeadTrackers.into()),
+        };
+
+        let s = stream.peer_addr()?;
+        let (reader, writer) = split(stream);
+        let (tx, mut rx) = channel(100);
+
+        debug!("spawned tasks for [{:?}]", s);
+
+        tokio::spawn(async move {
+            Connection::listen(reader, tx);
+        });
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                debug!(?msg);
+            }
+        });
+
+        loop {}
+
+        Ok(())
+    }
 }
 
 pub struct Connection {
@@ -62,11 +142,13 @@ impl Connection {
             let mut buf = Vec::new();
             match reader.read_to_end(&mut buf).await {
                 Ok(n) => {
+                    debug!("received something");
                     for message in Message::parse_all(&buf) {
-                        tx.send(message);
+                        tx.send(message).await?;
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    debug!("blocked!");
                     continue;
                 }
                 Err(e) => {
@@ -76,49 +158,49 @@ impl Connection {
         }
     }
 
-    pub async fn resolve(&mut self) -> Result<(), Report> {
-        while let Some(message) = self.rx.recv().ok() {
-            match message {
-                Message::Choke => {
-                    self.state.choked = true;
-                }
-                Message::Unchoke => {
-                    self.state.choked = false;
-                }
-                Message::Interested => {
-                    self.state.interested = true;
-                }
-                Message::Uninterested => {
-                    self.state.interested = false;
-                }
-                Message::Have(idx) => {
-                    let n = self.state.remote_bitfield[idx / 8] as usize;
-                    let missing = n | (idx % 8);
-                    debug!(missing = ?missing);
-                    let n = self.state.remote_bitfield.get_mut(idx / 8).unwrap();
-                    *n |= (idx % 8) as u8;
-                }
-                Message::Bitfield(v) => {
-                    self.state.remote_bitfield = v;
-                }
-                Message::Request {
-                    index,
-                    begin,
-                    length,
-                } => todo!(),
-                Message::Piece {
-                    index,
-                    begin,
-                    block,
-                } => todo!(),
-                Message::Cancel {
-                    index,
-                    begin,
-                    length,
-                } => todo!(),
-                Message::Port(_) => todo!(),
-            }
-        }
+    pub async fn resolve(mut self) -> Result<(), Report> {
+        // while let Some(message) = self.rx.recv().ok() {
+        //     match message {
+        //         Message::Choke => {
+        //             self.state.choked = true;
+        //         }
+        //         Message::Unchoke => {
+        //             self.state.choked = false;
+        //         }
+        //         Message::Interested => {
+        //             self.state.interested = true;
+        //         }
+        //         Message::Uninterested => {
+        //             self.state.interested = false;
+        //         }
+        //         Message::Have(idx) => {
+        //             let n = self.state.remote_bitfield[idx / 8] as usize;
+        //             let missing = n | (idx % 8);
+        //             debug!(missing = ?missing);
+        //             let n = self.state.remote_bitfield.get_mut(idx / 8).unwrap();
+        //             *n |= (idx % 8) as u8;
+        //         }
+        //         Message::Bitfield(v) => {
+        //             self.state.remote_bitfield = v;
+        //         }
+        //         Message::Request {
+        //             index,
+        //             begin,
+        //             length,
+        //         } => todo!(),
+        //         Message::Piece {
+        //             index,
+        //             begin,
+        //             block,
+        //         } => todo!(),
+        //         Message::Cancel {
+        //             index,
+        //             begin,
+        //             length,
+        //         } => todo!(),
+        //         Message::Port(_) => todo!(),
+        //     }
+        // }
         Ok(())
     }
 }
@@ -140,80 +222,6 @@ impl State {
             peer_choked: true,
             peer_interested: false,
             remote_bitfield: Vec::new(),
-        }
-    }
-}
-
-impl PeerRouter {
-    pub fn new(magnet: MagnetInfo) -> Self {
-        PeerRouter {
-            magnet,
-            peers: HashMap::new(),
-            bitfield: Vec::new(),
-        }
-    }
-
-    pub async fn connect(&mut self, peers: Vec<SocketAddr>) -> Result<(), Report> {
-        let peer_id = rand::thread_rng().gen::<[u8; 20]>();
-        let handshake = Handshake::new(self.magnet.hash, peer_id);
-
-        let mut set = JoinSet::new();
-
-        for &s in peers.iter() {
-            set.spawn(PeerRouter::handshake(s, handshake.clone()));
-        }
-
-        while let Some(result) = set.join_next().await {
-            match result? {
-                Ok(stream) => {
-                    let s = stream.peer_addr()?;
-                    let (reader, writer) = split(stream);
-                    let (tx, rx) = channel();
-
-                    tokio::spawn(async move {
-                        Connection::listen(reader, tx);
-                    });
-                    self.peers.insert(s, Connection::new(writer, rx));
-                }
-                Err(_) => {
-                    continue;
-                }
-            }
-        }
-
-        let mut set: JoinSet<()> = JoinSet::new();
-
-        debug!("resolving?");
-        for conn in self.peers.values_mut() {
-            conn.resolve().await?;
-        }
-
-        Ok(())
-    }
-
-    pub async fn keep_alive() {
-        loop {
-            sleep(Duration::from_secs(120)).await;
-        }
-    }
-
-    pub async fn handshake(
-        peer: SocketAddr,
-        handshake: Handshake<'_>,
-    ) -> Result<TcpStream, Report> {
-        let mut stream = timeout(Duration::from_secs(3), TcpStream::connect(peer)).await??;
-
-        stream.write_all(&handshake.to_request()).await?;
-        stream.flush().await?;
-        let mut buf = Vec::with_capacity(68);
-        debug!("handshake was sent to {peer:?} ...");
-
-        match timeout(Duration::from_secs(3), stream.read_exact(&mut buf)).await? {
-            Ok(n) if n != 0 => {
-                let handshake = Handshake::from_response(&buf[..]);
-                Ok(stream)
-            }
-            _ => Err(GeneralError::DeadTrackers.into()),
         }
     }
 }

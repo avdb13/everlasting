@@ -6,7 +6,7 @@ use router::Tracker;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 use crate::app::App;
-use crate::peer::PeerRouter;
+use crate::peer::Router;
 use crate::router::Message;
 use app::Action;
 
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Report> {
             let (socket, (tx, rx)) = tracker_setup(&magnet).await?;
 
             let tracker = Tracker::new(&magnet, socket.clone(), rx)?;
-            let handle = tokio::spawn(async move { Tracker::listen(socket.clone(), tx).await });
+            let handle = tokio::spawn(listen(socket.clone(), tx));
 
             let peers = tracker.run().await?;
 
@@ -136,7 +136,7 @@ async fn main() -> Result<(), Report> {
         Err(e) => return Err(e.into()),
     };
 
-    let mut r = PeerRouter::new(magnet);
+    let mut r = Router::new(magnet);
     r.connect(peers.clone()).await?;
 
     Ok(())
@@ -166,3 +166,20 @@ type Artifacts = (
         HashMap<SocketAddr, Receiver<Response>>,
     ),
 );
+
+pub async fn listen(socket: Arc<UdpSocket>, tx: HashMap<SocketAddr, Sender<Response>>) {
+    loop {
+        let mut buf = [0u8; 1024];
+        match socket.clone().recv_from(&mut buf).await {
+            Ok((n, peer)) => {
+                let resp = Response::to_response(&buf[..n]).unwrap();
+                debug!("listener received value: {:?}", &resp);
+
+                let tx = tx.get(&peer).unwrap();
+                tx.send(resp).await.unwrap();
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+            Err(e) => panic!("{}", e),
+        }
+    }
+}
