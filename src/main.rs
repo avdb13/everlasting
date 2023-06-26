@@ -1,64 +1,41 @@
-#![allow(warnings)]
-#![feature(try_blocks)]
-#![feature(async_closure)]
-use bendy::decoding::{FromBencode, ResultExt};
+use crate::data::MagnetInfo;
+use dht::Node;
+use kv::{Config, Store};
 use router::Tracker;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use tracker::to_torrent;
 
-use crate::app::App;
 use crate::peer::Router;
-use crate::router::Message;
-use app::Action;
 
 use color_eyre::Report;
 
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-
-use data::{Metadata, Mode, SocketResponse};
-use futures_util::future;
-use once_cell::sync::OnceCell;
-
-use rand::Rng;
-
-use tokio::time::sleep;
 use udp::Response;
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 
-use std::io;
-use std::sync::Arc;
-use std::time::Duration;
-use std::vec::IntoIter;
-use thiserror::Error;
+use std::path::Path;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{
-    self, channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
-};
-use tokio::sync::Mutex;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-use tracing::{debug, info};
+use tracing::debug;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use tui::backend::CrosstermBackend;
-use tui::Terminal;
-use url::Url;
-use writer::Writer;
 
 pub mod app;
 pub mod bencode;
 pub mod data;
+pub mod dht;
 pub mod helpers;
+pub mod krpc;
 pub mod peer;
 pub mod router;
 pub mod scrape;
 pub mod socket;
 pub mod state;
+mod tracker;
 pub mod udp;
 pub mod writer;
 
@@ -68,46 +45,27 @@ use crate::helpers::*;
 async fn main() -> Result<(), Report> {
     color_eyre::install()?;
 
+    let store = Store::new(Config::new("./kv.conf"))?;
+    // store.bucket::<Node, Vec<SocketAddr>>(Some("DHT"));
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "everlasting=debug".into()),
+            // .unwrap_or_else(|_| "everlasting=debug,tokio=trace,runtime=trace".into()),
         ))
         .with(tracing_subscriber::fmt::layer())
+        .with(console_subscriber::spawn())
         .init();
 
-    let mut s = File::open("test.torrent")?;
+    let mut s = File::open("magnet")?;
     let mut buf: Vec<u8> = Vec::new();
     s.read_to_end(&mut buf)?;
 
-    let mut torrent = Metadata::from_bencode(&buf).expect("torrent file not found!");
-
-    // let mut s = File::open("magnet")?;
-    // let mut buf: Vec<u8> = Vec::new();
-    // s.read_to_end(&mut buf)?;
-
-    let trackers = torrent
-        .announce_list
-        .unwrap()
-        .iter()
-        .flatten()
-        .flat_map(|s| udp_address_to_ip(s))
-        .collect();
-    let magnet = match torrent.info.mode {
-        Mode::Single { name, .. } => MagnetInfo {
-            hash: torrent.info.value,
-            name,
-            trackers,
-        },
-        Mode::Multi { dir_name, .. } => MagnetInfo {
-            hash: torrent.info.value,
-            name: dir_name,
-            trackers,
-        },
-    };
-    // let magnet = magnet_decoder(std::str::from_utf8(&buf)?)?;
+    let magnet = magnet_decoder(std::str::from_utf8(&buf)?)?;
+    // let ok = to_torrent(magnet.clone()).await?;
 
     let peers = match File::open("peers") {
-        Ok(mut f) => {
+        Ok(f) => {
             debug!("peers are already found!");
 
             let lines = BufReader::new(f).lines();
@@ -129,8 +87,6 @@ async fn main() -> Result<(), Report> {
                 writeln!(out, "{peer:?}")?;
             }
 
-            handle.abort();
-
             peers
         }
         Err(e) => return Err(e.into()),
@@ -146,9 +102,10 @@ async fn tracker_setup(magnet: &MagnetInfo) -> Result<Artifacts, Report> {
     let map: Vec<_> = magnet
         .trackers
         .iter()
-        .map(|&s| {
+        .flat_map(|s| {
+            let s = udp_to_ip(&s)?;
             let (tx, rx) = channel::<Response>(5);
-            ((s, tx), (s, rx))
+            Some(((s, tx), (s, rx)))
         })
         .collect();
     let (tx, rx): (HashMap<_, _>, HashMap<_, _>) = map.into_iter().unzip();

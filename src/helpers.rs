@@ -8,7 +8,7 @@ use rand::seq::SliceRandom;
 use tracing::debug;
 use url::Url;
 
-use crate::data::GeneralError;
+use crate::data::{GeneralError, MagnetInfo};
 
 pub fn prettier(s: String) -> String {
     s.chars()
@@ -50,13 +50,7 @@ pub fn encode(arr: &[u8]) -> String {
         .collect()
 }
 
-#[derive(Clone, Default, Debug)]
-pub struct MagnetInfo {
-    pub hash: [u8; 20],
-    pub name: String,
-    pub trackers: Vec<SocketAddr>,
-}
-
+// TODO: reconsider whether we want to use the same decoder for magnets and torrent files.
 pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
     let url = Url::parse(s.as_ref())?;
     let pairs = url.query_pairs().into_owned();
@@ -70,8 +64,8 @@ pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
                 info.hash = decode(url.to_owned());
             }
             ("tr", s) => {
-                let dst = udp_address_to_ip(&s).ok_or(GeneralError::InvalidTracker(s))?;
-                info.trackers.push(dst);
+                // let dst = udp_to_ip(&s).ok_or(GeneralError::InvalidTracker(s))?;
+                info.trackers.push(s);
             }
             ("dn", s) => {
                 info.name = s;
@@ -85,7 +79,7 @@ pub fn magnet_decoder<S: AsRef<str>>(s: S) -> Result<MagnetInfo, Report> {
     Ok(info)
 }
 
-pub fn udp_address_to_ip(s: &str) -> Option<SocketAddr> {
+pub fn udp_to_ip(s: &str) -> Option<SocketAddr> {
     let url: Url = Url::parse(&s).ok()?;
 
     let (addr, port) = (url.host_str()?, url.port()?);

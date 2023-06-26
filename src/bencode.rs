@@ -1,16 +1,20 @@
 use hex::FromHex;
 
-use bendy::decoding::{Decoder, FromBencode, Object};
+use bendy::{
+    decoding::{Decoder, FromBencode, Object},
+    encoding::{Encoder, Error, SingleItemEncoder, ToBencode},
+};
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 use tracing::debug;
 
 use crate::{
-    data::{File, HttpResponse, Info, Metadata, Mode, Peer, ScrapeResponse, Status, SHA1_LEN},
+    data::{File, HttpResponse, Info, Mode, Peer, ScrapeResponse, Status, TorrentInfo, SHA1_LEN},
     helpers::range_to_array,
+    peer::Extension,
 };
 
-impl FromBencode for Metadata {
+impl FromBencode for TorrentInfo {
     const EXPECTED_RECURSION_DEPTH: usize = 5;
 
     fn decode_bencode_object(
@@ -20,7 +24,7 @@ impl FromBencode for Metadata {
         Self: Sized,
     {
         let mut dict = object.try_into_dictionary()?;
-        let mut md = Metadata::default();
+        let mut md = TorrentInfo::default();
 
         while let Some(pair) = dict.next_pair()? {
             match pair {
@@ -43,28 +47,23 @@ impl FromBencode for Metadata {
                 (b"announce", _) => {
                     let s = String::decode_bencode_object(pair.1)?;
                     debug!(?s);
-                    md.announce = s;
+                    md.announce.push(s);
                 }
                 (b"announce-list", list) => {
-                    let mut v: Vec<Vec<String>> = Vec::new();
+                    // Not bothering separating announce and announce-list since they both contain
+                    // tracker URLs.
                     let mut list = list.try_into_list()?;
 
                     while let Some(list) = list.next_object()? {
                         let mut list = list.try_into_list()?;
 
-                        let mut w = Vec::new();
-
                         while let Some(s) = list.next_object()? {
                             let s = String::decode_bencode_object(s)?;
                             if s.starts_with("udp") {
-                                w.push(s);
+                                md.announce.push(s);
                             }
                         }
-
-                        v.push(w);
                     }
-
-                    md.announce_list = Some(v);
                 }
                 (b"creation date", _) => {
                     let i = u64::decode_bencode_object(pair.1)?;
@@ -147,7 +146,8 @@ impl FromBencode for Info {
             Mode::Multi {
                 mut dir_name,
                 mut files,
-                mut md5sum,
+                // TODO: check whether md5sums are still relevant in $CURRENT_YEAR.
+                md5sum,
             } => {
                 while let Some(pair) = dict.next_pair()? {
                     dbg!(&std::str::from_utf8(pair.0).unwrap());
@@ -175,7 +175,6 @@ impl FromBencode for Info {
                             dir_name = String::decode_bencode_object(pair.1).unwrap();
                         }
                         (b"files", list) => {
-                            let mut files: Vec<File> = Vec::new();
                             let mut list = list.try_into_list()?;
 
                             while let Some(file) = list.next_object()? {
@@ -384,5 +383,19 @@ impl FromBencode for ScrapeResponse {
             }
         }
         Ok(Self { files: result })
+    }
+}
+
+impl ToBencode for Extension {
+    const MAX_DEPTH: usize = 3;
+
+    fn encode(&self, encoder: SingleItemEncoder) -> Result<(), Error> {
+        let mut extensions = Encoder::new();
+        extensions.emit_and_sort_dict(|mut e| e.emit_pair(b"ut_metadata", 3))?;
+
+        encoder.emit_dict(|mut e| {
+            e.emit_pair(b"m", extensions.get_output()?);
+            e.emit_pair(b"metadata_size", 31235)
+        })
     }
 }

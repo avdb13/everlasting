@@ -1,13 +1,7 @@
-use std::{
-    fmt::Display,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use color_eyre::Report;
-use rand::Rng;
 use tracing::debug;
-
-use crate::helpers::{decode, MagnetInfo};
 
 #[derive(Clone, Debug)]
 pub enum Request {

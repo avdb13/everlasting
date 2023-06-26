@@ -1,5 +1,6 @@
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
+use crate::{data::MagnetInfo, helpers::udp_to_ip};
 use color_eyre::Report;
 use dashmap::DashMap;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
@@ -14,7 +15,6 @@ use tracing::debug;
 
 use crate::{
     data::{GeneralError, PROTOCOL_ID},
-    helpers::MagnetInfo,
     udp::{Request, Response, TransferEvent},
 };
 
@@ -44,9 +44,10 @@ impl Tracker {
         let trackers = magnet
             .trackers
             .iter()
-            .map(|&s| {
+            .flat_map(|s| {
+                let s = udp_to_ip(s)?;
                 let rx = rx.remove(&s).unwrap();
-                (s, Session::new(magnet.hash, s, socket.clone(), rx))
+                Some((s, Session::new(magnet.hash, s, socket.clone(), rx)))
             })
             .collect();
 

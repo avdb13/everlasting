@@ -26,13 +26,20 @@ pub const PROTOCOL_ID: i64 = 0x41727101980;
 pub const SHA1_LEN: usize = 20;
 
 #[derive(Default, Debug, Eq, PartialEq)]
-pub struct Metadata {
+pub struct TorrentInfo {
     pub info: Info,
-    pub announce: String,
-    pub announce_list: Option<Vec<Vec<String>>>,
+    // no need for Vec<Vec<T>> as torrents rarely use this nesting nowadays
+    pub announce: Vec<String>,
     pub created: Option<u64>,
     pub comment: String,
     pub author: Option<String>,
+}
+
+#[derive(Clone, Default, Debug)]
+pub struct MagnetInfo {
+    pub hash: [u8; 20],
+    pub name: String,
+    pub trackers: Vec<String>,
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
@@ -42,6 +49,14 @@ pub struct Info {
     pub pieces: Vec<[u8; SHA1_LEN]>,
     pub private: Option<()>,
     pub value: [u8; 20],
+}
+
+pub struct Extension {
+    pub messages: Vec<(String, u8)>,
+    pub port: Option<u8>,
+    pub client_name: Option<String>,
+    pub ip: Option<SocketAddr>,
+    pub reqq: Option<u8>,
 }
 
 #[derive(Debug, PartialEq, Eq)]

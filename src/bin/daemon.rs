@@ -6,12 +6,12 @@ pub async fn main() -> Result<(), Report> {
     color_eyre::install()?;
 
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .without_time()
-                .with_level(false)
-                .with_target(false),
-        )
+        .with(tracing_subscriber::EnvFilter::new(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "daemon=trace".into()),
+        ))
+        .with(tracing_subscriber::fmt::layer())
+        .with(console_subscriber::spawn())
         .init();
+
     Ok(())
 }

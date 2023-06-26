@@ -1,29 +1,25 @@
-use bytes::BytesMut;
-use dashmap::DashMap;
-use std::collections::VecDeque;
-use std::io::Write;
-use std::{
-    collections::HashMap, io::ErrorKind, mem::discriminant, net::SocketAddr, sync::Arc,
-    time::Duration,
+use bendy::encoding::ToBencode;
+use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use tokio::{
+    net::{TcpStream, UdpSocket},
+    sync::mpsc::{channel, Receiver, Sender},
+    task::JoinSet,
 };
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::task::JoinHandle;
 
 use color_eyre::Report;
 use rand::Rng;
-use std::fs::File;
+
 use tokio::{
     io::{self, split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
-    net::{TcpListener, TcpSocket, TcpStream, UdpSocket},
-    sync::{mpsc, RwLock},
-    task::JoinSet,
     time::{sleep, timeout},
 };
-use tracing::{debug, field::debug};
+use tracing::{debug, info};
 
 use crate::{
-    data::GeneralError,
-    helpers::{self, decode, range_to_array, MagnetInfo},
+    data::{GeneralError, MagnetInfo},
+    dht::Node,
+    helpers::{self, decode, range_to_array},
+    krpc::{self, Arguments, Method},
     udp::{Request, Response},
 };
 
@@ -48,8 +44,9 @@ impl Router {
 
         let mut set = JoinSet::new();
 
+        let socket = Arc::new(UdpSocket::bind("0.0.0.0:6969").await?);
         for &s in peers.iter() {
-            set.spawn(Router::handshake(s, handshake.clone()));
+            set.spawn(Router::handshake(socket.clone(), s, handshake.clone()));
         }
 
         while let Some(result) = set.join_next().await {
@@ -82,42 +79,64 @@ impl Router {
         }
     }
 
-    pub async fn handshake(peer: SocketAddr, handshake: Handshake<'_>) -> Result<(), Report> {
+    pub async fn handshake(
+        dht_socket: Arc<UdpSocket>,
+        peer: SocketAddr,
+        handshake: Handshake<'_>,
+    ) -> Result<(), Report> {
         let mut stream = timeout(Duration::from_secs(3), TcpStream::connect(peer)).await??;
 
         stream.write_all(&handshake.to_request()).await?;
         stream.flush().await?;
-        debug!("handshake was sent to {peer:?} ...");
+        debug!("handshake was sent to [{peer:?}] ...");
 
         let mut buf = [0u8; 68];
 
         match timeout(Duration::from_secs(3), stream.read_exact(&mut buf)).await? {
             Ok(n) if n != 0 => {
+                debug!("[{peer:?}] received the handshake ...");
                 let handshake = Handshake::from_response(&buf[..]);
             }
             _ => return Err(GeneralError::DeadTrackers.into()),
         };
 
-        let s = stream.peer_addr()?;
+        let remote_peer = stream.peer_addr()?;
         let (reader, writer) = split(stream);
         let (tx, mut rx) = channel(100);
 
-        debug!("spawned tasks for [{:?}]", s);
+        let handle = tokio::spawn(Connection::listen(reader, tx));
+        debug!("[{peer:?}] is listening for messages ...");
 
-        tokio::spawn(async move {
-            Connection::listen(reader, tx);
-        });
-        tokio::spawn(async move {
-            while let Some(msg) = rx.recv().await {
-                debug!(?msg);
+        while let Some(Message::Port(n)) = rx.recv().await {
+            let s = SocketAddr::new(remote_peer.ip(), n);
+            dht_socket.connect(s).await?;
+
+            let args = Arguments {
+                method: Method::Ping,
+                id: rand::thread_rng().gen(),
+                ..Default::default()
+            };
+
+            // query: Box::new(krpc::DHTMessage::Ping),
+            // node_id: Node(rand::thread_rng().gen()),
+            let msg = krpc::Message::Query(args);
+            // let buf = msg.to_bencode().unwrap();
+            loop {}
+            dht_socket.send(&buf).await?;
+
+            let mut buf = Vec::new();
+            while let Ok(n) = dht_socket.recv(&mut buf).await {
+                if n != 0 {
+                    debug!("received: {:?}", &buf[..n]);
+                }
             }
-        });
-
-        loop {}
+        }
 
         Ok(())
     }
 }
+
+pub struct DhtConnection;
 
 pub struct Connection {
     pub writer: WriteHalf<TcpStream>,
@@ -139,22 +158,30 @@ impl Connection {
         tx: Sender<Message>,
     ) -> Result<(), Report> {
         loop {
-            let mut buf = Vec::new();
-            match reader.read_to_end(&mut buf).await {
-                Ok(n) => {
-                    debug!("received something");
-                    for message in Message::parse_all(&buf) {
-                        tx.send(message).await?;
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    debug!("blocked!");
-                    continue;
-                }
-                Err(e) => {
-                    return Err(e.into());
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf).await?;
+
+            let n = u32::from_be_bytes(range_to_array(&buf));
+
+            let mut buf = vec![0; (n + 1) as usize];
+            loop {
+                match reader.read_exact(&mut buf).await {
+                    // Ok(n) if n != 0 => break,
+                    Ok(_) => break,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+                    Err(e) => return Err(e.into()),
                 }
             }
+            dbg!(&buf[0]);
+
+            let message = Message::parse(&buf, n as usize);
+            match &message {
+                Message::Bitfield(_) => {}
+                message => {
+                    debug!(?message);
+                }
+            }
+            tx.send(message).await?;
         }
     }
 
@@ -236,11 +263,21 @@ pub struct Handshake<'p> {
     payload: Option<&'p [u8]>,
 }
 
+pub enum Extension {
+    DHT = 64,
+}
+
 impl<'p> Handshake<'p> {
     fn new(hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+        let mut reserved = [0u8; 8];
+        // DHT protocol
+        reserved[7] |= 0x01;
+        // extension protocol
+        reserved[5] &= 0x20;
+
         Self {
             pstr: Some("BitTorrent protocol".to_owned()),
-            reserved: [0u8; 8],
+            reserved,
             hash,
             peer_id,
             payload: None,
@@ -248,14 +285,17 @@ impl<'p> Handshake<'p> {
     }
     fn to_request(&self) -> Vec<u8> {
         let pstr = self.pstr.as_ref().unwrap();
-        [
+        let handshake = [
             &[pstr.len() as u8],
             pstr.as_bytes(),
-            &[0u8; 8],
+            &self.reserved,
             &self.hash,
             &self.peer_id,
         ]
-        .concat()
+        .concat();
+
+        // let extended_handshake =
+        handshake
     }
     fn from_response(v: &'p [u8]) -> Self {
         let reserved = range_to_array(&v[20..28]);
@@ -301,6 +341,7 @@ pub enum Message {
         length: usize,
     },
     Port(u16),
+    Extended = 20,
 }
 
 impl Message {
@@ -327,84 +368,68 @@ impl Message {
             Piece { .. } => 7,
             Cancel { .. } => 8,
             Port(_) => 9,
+            Extended => 20,
         }
     }
 
-    fn parse_all(v: &[u8]) -> Vec<Message> {
+    fn parse(v: &[u8], len: usize) -> Message {
         use Message::*;
-        let u32_len = std::mem::size_of::<u32>() as u32;
 
-        let mut offset = 0u32;
+        match v[0] {
+            0 => Choke,
+            1 => Unchoke,
+            2 => Interested,
+            3 => Uninterested,
+            4 => Have(usize::from_be_bytes(range_to_array(&v[1..]))),
+            5 => {
+                let payload = v[..len]
+                    .iter()
+                    .flat_map(|n| (0..8).map(|i| (n >> i) & 1).collect::<Vec<_>>())
+                    .collect();
 
-        let mut result = Vec::new();
-        while offset < (v.len() - 1) as u32 {
-            let message = match v[4] {
-                0 => {
-                    offset += u32_len + 1;
-                    Choke
-                }
-                1 => {
-                    offset += u32_len + 1;
-                    Unchoke
-                }
-                2 => {
-                    offset += u32_len + 1;
-                    Interested
-                }
-                3 => {
-                    offset += u32_len + 1;
-                    Uninterested
-                }
-                4 => {
-                    offset += u32_len + 5;
-                    Have(usize::from_be_bytes(range_to_array(&v[1..])))
-                }
-                5 => {
-                    let n = u32::from_be_bytes(range_to_array(&v[0..4]));
-                    debug!(?n);
-                    offset += u32_len + 1 + n;
-                    let v = v[(u32_len + 1) as usize..]
-                        .iter()
-                        .flat_map(|n| (0..8).map(|i| (n >> i) & 1).collect::<Vec<_>>())
-                        .collect();
-                    Bitfield(v)
-                }
-                6 => {
-                    offset += u32_len + 13;
-                    Request {
-                        index: 0,
-                        begin: 0,
-                        length: 0,
-                    }
-                }
-                7 => {
-                    offset += u32_len + 9;
-                    Piece {
-                        index: 0,
-                        begin: 0,
-                        block: Vec::new(),
-                    }
-                }
-                8 => {
-                    offset += u32_len + 13;
-                    Cancel {
-                        index: 0,
-                        begin: 0,
-                        length: 0,
-                    }
-                }
-                9 => {
-                    offset += u32_len + 3;
-                    Port(0)
-                }
-                _ => panic!(),
-            };
+                Bitfield(payload)
+            }
+            6 => {
+                let index = u32::from_be_bytes(range_to_array(&v[1..5])) as usize;
+                let begin = u32::from_be_bytes(range_to_array(&v[5..9])) as usize;
+                let length = u32::from_be_bytes(range_to_array(&v[9..13])) as usize;
 
-            debug!(message = ?message);
+                Request {
+                    index,
+                    begin,
+                    length,
+                }
+            }
+            7 => {
+                let index = u32::from_be_bytes(range_to_array(&v[1..5])) as usize;
+                let begin = u32::from_be_bytes(range_to_array(&v[5..9])) as usize;
 
-            result.push(message);
+                let block = v[..len].iter().map(|&i| i as usize).collect();
+
+                Piece {
+                    index,
+                    begin,
+                    block,
+                }
+            }
+            8 => {
+                let index = u32::from_be_bytes(range_to_array(&v[1..5])) as usize;
+                let begin = u32::from_be_bytes(range_to_array(&v[5..9])) as usize;
+                let length = u32::from_be_bytes(range_to_array(&v[9..13])) as usize;
+
+                Cancel {
+                    index,
+                    begin,
+                    length,
+                }
+            }
+            9 => {
+                let port = u16::from_be_bytes(range_to_array(&v[1..3]));
+
+                Port(port)
+            }
+            20 => Extended,
+            _ => panic!(),
         }
-
-        result
     }
 }
