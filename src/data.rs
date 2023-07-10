@@ -6,43 +6,64 @@ use crate::udp::Response;
 
 pub type SocketResponse = (Response, SocketAddr);
 
+pub enum Event {
+    None = 0,
+    Completed,
+    Started,
+    Stopped,
+}
+
 #[derive(Error, Debug)]
 pub enum GeneralError {
     #[error("usage: everlasting [torrent file | magnet link]")]
     Usage,
+    #[error("file does not exist")]
+    NonExistentFile,
     #[error("magnet link contains no valid trackers: `{0:?}`")]
-    InvalidTracker(String),
+    InvalidUdpTracker(String),
+    #[error("magnet link is invalid: `{0:?}`")]
+    InvalidMagnet(String),
     #[error("no active trackers for this torrent")]
-    DeadTrackers,
+    DeadUdpTrackers,
     #[error("timeout")]
     Timeout,
     #[error("reconnect")]
     Reconnect,
     #[error("unexpected response: {0}")]
     UnexpectedResponse(String),
+    #[error("failed to parse URL: {0}")]
+    ParseFailure(String),
 }
 
 pub const PROTOCOL_ID: i64 = 0x41727101980;
 pub const SHA1_LEN: usize = 20;
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Default, Debug, PartialEq, Clone)]
+pub struct Announce {
+    pub udp: Vec<Vec<SocketAddr>>,
+    pub http: Vec<String>,
+}
+
+#[derive(Default, Debug, PartialEq, Clone)]
 pub struct TorrentInfo {
     pub info: Info,
-    // no need for Vec<Vec<T>> as torrents rarely use this nesting nowadays
-    pub announce: Vec<String>,
+    // no need for Vec<Vec<T>> as torrents rarely have only one tracker
+    pub announce: Announce,
     pub created: Option<u64>,
     pub comment: String,
     pub author: Option<String>,
 }
 
-#[derive(Clone, Default, Debug)]
-pub struct MagnetInfo {
-    pub hash: [u8; 20],
-    pub name: String,
-    pub trackers: Vec<String>,
+impl TorrentInfo {
+    pub fn length(&self) -> u64 {
+        match &self.info.mode {
+            Mode::Single { length, .. } => length.to_owned(),
+            Mode::Multi { files, .. } => files.iter().map(|f| f.length).sum(),
+        }
+    }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct Info {
     pub mode: Mode,
     pub piece_length: u64,
@@ -51,15 +72,7 @@ pub struct Info {
     pub value: [u8; 20],
 }
 
-pub struct Extension {
-    pub messages: Vec<(String, u8)>,
-    pub port: Option<u8>,
-    pub client_name: Option<String>,
-    pub ip: Option<SocketAddr>,
-    pub reqq: Option<u8>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Mode {
     Single {
         name: String,
@@ -83,29 +96,22 @@ impl Default for Mode {
     }
 }
 
-#[derive(Default, Debug, PartialEq, Eq)]
+#[derive(Clone, Default, Debug, PartialEq)]
 pub struct File {
     pub length: u64,
     pub md5sum: Option<Vec<u8>>,
     pub path: Vec<String>,
 }
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Peer {
-    pub id: String,
-    pub ip: String,
-    pub port: String,
+    pub id: Option<[u8; 20]>,
+    pub addr: SocketAddr,
 }
 
-impl Peer {
-    pub fn new() -> Self {
-        Self {
-            ..Default::default()
-        }
-    }
-}
+pub type Peers = Vec<Peer>;
 
-#[derive(Default, Debug, Eq, PartialEq)]
+#[derive(Default, Debug, PartialEq)]
 pub struct HttpResponse {
     pub failure_reason: Option<String>,
     pub warning: Option<String>,

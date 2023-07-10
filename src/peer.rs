@@ -1,5 +1,11 @@
 use bendy::encoding::ToBencode;
-use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    io::ErrorKind,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     net::{TcpStream, UdpSocket},
     sync::mpsc::{channel, Receiver, Sender},
@@ -13,15 +19,19 @@ use tokio::{
     io::{self, split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
     time::{sleep, timeout},
 };
-use tracing::{debug, info};
+use tracing::{debug, field::debug, info};
 
 use crate::{
-    data::{GeneralError, MagnetInfo},
+    data::GeneralError,
     dht::Node,
+    extensions::ExtensionHeader,
     helpers::{self, decode, range_to_array},
-    krpc::{self, Arguments, Method},
+    krpc::{self, Arguments, ExtMessage, Method},
+    magnet::MagnetInfo,
     udp::{Request, Response},
 };
+
+type Bitfield = Vec<u8>;
 
 pub struct Router {
     pub magnet: MagnetInfo,
@@ -60,23 +70,7 @@ impl Router {
             }
         }
 
-        // for conn in self.peers.values_mut() {
-        //     set.spawn(conn.resolve());
-        // }
-        // while let Some(result) = set.join_next().await {
-        //     match result {
-        //         Ok(_) => todo!(),
-        //         Err(_) => todo!(),
-        //     }
-        // }
-
         Ok(())
-    }
-
-    pub async fn keep_alive() {
-        loop {
-            sleep(Duration::from_secs(120)).await;
-        }
     }
 
     pub async fn handshake(
@@ -92,51 +86,55 @@ impl Router {
 
         let mut buf = [0u8; 68];
 
-        match timeout(Duration::from_secs(3), stream.read_exact(&mut buf)).await? {
+        match timeout(Duration::from_secs(10), stream.read_exact(&mut buf)).await? {
             Ok(n) if n != 0 => {
                 debug!("[{peer:?}] received the handshake ...");
                 let handshake = Handshake::from_response(&buf[..]);
+
+                if handshake.reserved[7] | 0x01 == 1 {
+                    debug!("supports DHT: {}", stream.peer_addr()?);
+                }
             }
-            _ => return Err(GeneralError::DeadTrackers.into()),
+            _ => return Err(GeneralError::DeadUdpTrackers.into()),
         };
 
-        let remote_peer = stream.peer_addr()?;
-        let (reader, writer) = split(stream);
+        // TcpStream to the peer (PWP)
+        let (reader, mut writer) = split(stream);
+        // RX will relay all received messages
         let (tx, mut rx) = channel(100);
 
         let handle = tokio::spawn(Connection::listen(reader, tx));
         debug!("[{peer:?}] is listening for messages ...");
 
-        while let Some(Message::Port(n)) = rx.recv().await {
-            let s = SocketAddr::new(remote_peer.ip(), n);
-            dht_socket.connect(s).await?;
+        let msg = Message::Extended;
+        let payload = Some(ExtensionHeader::default().to_bencode().unwrap());
 
-            let args = Arguments {
-                method: Method::Ping,
-                id: rand::thread_rng().gen(),
-                ..Default::default()
-            };
+        writer.write_all(&msg.to_request(payload)).await?;
+        writer.flush().await?;
 
-            // query: Box::new(krpc::DHTMessage::Ping),
-            // node_id: Node(rand::thread_rng().gen()),
-            let msg = krpc::Message::Query(args);
-            // let buf = msg.to_bencode().unwrap();
-            loop {}
-            dht_socket.send(&buf).await?;
+        // while let Some(Message::Port(n)) = rx.recv().await {
+        //     let s = SocketAddr::new(remote_peer.ip(), n);
+        //     dht_socket.connect(s).await?;
 
-            let mut buf = Vec::new();
-            while let Ok(n) = dht_socket.recv(&mut buf).await {
-                if n != 0 {
-                    debug!("received: {:?}", &buf[..n]);
-                }
-            }
-        }
+        //     let mut buf = Vec::new();
+        //     while let Ok(n) = dht_socket.recv(&mut buf).await {
+        //         if n != 0 {
+        //             debug!("received: {:?}", &buf[..n]);
+        //         }
+        //     }
+        // }
 
         Ok(())
     }
-}
 
-pub struct DhtConnection;
+    pub async fn request_piece(dht_socket: Arc<UdpSocket>) {
+        let req = Message::Request {
+            index: todo!(),
+            begin: todo!(),
+            length: todo!(),
+        };
+    }
+}
 
 pub struct Connection {
     pub writer: WriteHalf<TcpStream>,
@@ -263,13 +261,10 @@ pub struct Handshake<'p> {
     payload: Option<&'p [u8]>,
 }
 
-pub enum Extension {
-    DHT = 64,
-}
-
 impl<'p> Handshake<'p> {
     fn new(hash: [u8; 20], peer_id: [u8; 20]) -> Self {
         let mut reserved = [0u8; 8];
+
         // DHT protocol
         reserved[7] |= 0x01;
         // extension protocol
@@ -345,9 +340,9 @@ pub enum Message {
 }
 
 impl Message {
-    pub fn to_request(&self, payload: Option<&[u8]>) -> Vec<u8> {
+    pub fn to_request<V: AsRef<[u8]>>(&self, payload: Option<V>) -> Vec<u8> {
         let message = if let Some(payload) = payload {
-            [&[self.to_discriminant()], payload].concat()
+            [&[self.to_discriminant()], payload.as_ref()].concat()
         } else {
             [self.to_discriminant()].to_vec()
         };

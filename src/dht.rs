@@ -1,6 +1,21 @@
+use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc};
+
+use bendy::{decoding::FromBencode, encoding::ToBencode};
 use chrono::Utc;
+use color_eyre::Report;
+use lazy_static::lazy_static;
+use rand::Rng;
+use redb::TableDefinition;
+use tokio::{net::UdpSocket, sync::Mutex, task::JoinSet};
+use tracing::debug;
+
+use crate::krpc::{self, Arguments, ExtMessage, Method};
 
 const CAPACITY: usize = 8;
+
+lazy_static! {
+    static ref TABLE: Mutex<HashMap<[u8; 20], Node>> = Mutex::new(HashMap::new());
+}
 
 pub struct Table {
     id: Node,
@@ -12,7 +27,7 @@ pub struct Bucket {
     last_changed: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Debug)]
 pub struct Node(pub [u8; 20]);
 
 impl Node {
@@ -69,4 +84,57 @@ impl Table {
 
         todo!()
     }
+}
+
+pub async fn bootstrap_dht() -> Result<(), Report> {
+    let node_id = Node(rand::thread_rng().gen::<[u8; 20]>());
+
+    let dht_peers = [
+        "51.222.173.116:56216",
+        "87.10.113.39:50000",
+        "89.149.207.201:20033",
+    ];
+
+    let mut set = JoinSet::new();
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:4200").await?);
+
+    for peer in dht_peers {
+        set.spawn(ping_dht(
+            socket.clone(),
+            peer.parse::<SocketAddr>()?,
+            node_id.clone(),
+        ));
+    }
+
+    while let Some(ok) = set.join_next().await {
+        ok??;
+    }
+
+    Ok(())
+}
+
+async fn ping_dht(socket: Arc<UdpSocket>, peer: SocketAddr, node_id: Node) -> Result<(), Report> {
+    let ping: ExtMessage = krpc::Message::Query(Arguments {
+        method: Method::Ping,
+        id: node_id.0,
+        ..Default::default()
+    })
+    .into();
+
+    socket.send_to(&ping.to_bencode().unwrap(), peer).await?;
+
+    let mut buf = Vec::with_capacity(1024);
+    let (n, peer) = loop {
+        match socket.recv_from(&mut buf).await {
+            Ok(n) if n.0 != 0 => break n,
+            Ok(_) => continue,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
+            Err(e) => return Err(e.into()),
+        }
+    };
+
+    let resp = ExtMessage::from_bencode(&buf[..n]).unwrap();
+    debug!("{:?}: {:?}", peer, resp);
+
+    Ok(())
 }

@@ -1,25 +1,31 @@
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
+};
+
 use hex::FromHex;
 
 use bendy::{
-    decoding::{Decoder, FromBencode, Object},
-    encoding::{Encoder, Error, SingleItemEncoder, ToBencode},
+    decoding::{Decoder, Error as DecodingError, FromBencode, Object},
+    encoding::{
+        AsString, Encoder, Error as EncodingError, SingleItemEncoder, ToBencode,
+        UnsortedDictEncoder,
+    },
 };
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 use tracing::debug;
+use url::Url;
 
 use crate::{
     data::{File, HttpResponse, Info, Mode, Peer, ScrapeResponse, Status, TorrentInfo, SHA1_LEN},
     helpers::range_to_array,
-    peer::Extension,
 };
 
 impl FromBencode for TorrentInfo {
     const EXPECTED_RECURSION_DEPTH: usize = 5;
 
-    fn decode_bencode_object(
-        object: bendy::decoding::Object,
-    ) -> Result<Self, bendy::decoding::Error>
+    fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, DecodingError>
     where
         Self: Sized,
     {
@@ -46,8 +52,13 @@ impl FromBencode for TorrentInfo {
                 }
                 (b"announce", _) => {
                     let s = String::decode_bencode_object(pair.1)?;
-                    debug!(?s);
-                    md.announce.push(s);
+                    if s.starts_with("http") {
+                        md.announce.http.push(s.clone());
+                    }
+                    if s.starts_with("udp") {
+                        let addr = s.to_socket_addrs()?.collect();
+                        md.announce.udp.push(addr);
+                    }
                 }
                 (b"announce-list", list) => {
                     // Not bothering separating announce and announce-list since they both contain
@@ -59,8 +70,19 @@ impl FromBencode for TorrentInfo {
 
                         while let Some(s) = list.next_object()? {
                             let s = String::decode_bencode_object(s)?;
+
+                            if s.starts_with("http") {
+                                md.announce.http.push(s.clone());
+                            }
                             if s.starts_with("udp") {
-                                md.announce.push(s);
+                                let url = Url::parse(&s)?;
+                                let host = url.host().unwrap();
+                                let port = url.port().unwrap();
+
+                                let addr = (host.to_string(), port).to_socket_addrs()?;
+                                debug!(?addr);
+
+                                md.announce.udp.push(addr.collect());
                             }
                         }
                     }
@@ -118,9 +140,7 @@ impl FromBencode for TorrentInfo {
 impl FromBencode for Info {
     const EXPECTED_RECURSION_DEPTH: usize = 5;
 
-    fn decode_bencode_object(
-        object: bendy::decoding::Object,
-    ) -> Result<Self, bendy::decoding::Error>
+    fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, DecodingError>
     where
         Self: Sized,
     {
@@ -269,9 +289,7 @@ impl FromBencode for Info {
 impl FromBencode for HttpResponse {
     const EXPECTED_RECURSION_DEPTH: usize = 5;
 
-    fn decode_bencode_object(
-        object: bendy::decoding::Object,
-    ) -> Result<Self, bendy::decoding::Error>
+    fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, DecodingError>
     where
         Self: Sized,
     {
@@ -300,41 +318,60 @@ impl FromBencode for HttpResponse {
                 (b"peers", _) => {
                     let mut peers = Vec::new();
 
-                    if let Object::Dict(mut dict) = pair.1 {
-                        while let Some(pair) = dict.next_pair()? {
-                            let mut peer = Peer::new();
-                            match pair {
-                                (b"peer id", _) => {
-                                    peer.id = String::decode_bencode_object(pair.1)?;
+                    match pair.1 {
+                        Object::List(mut list) => {
+                            while let Some(dict) = list.next_object()? {
+                                let mut peer_id: Option<[u8; 20]> = Default::default();
+                                let mut ip = Default::default();
+                                let mut port = Default::default();
+
+                                let mut dict = dict.try_into_dictionary()?;
+
+                                while let Some(pair) = dict.next_pair()? {
+                                    match pair {
+                                        (b"peer id", _) => {
+                                            let AsString(s) =
+                                                AsString::decode_bencode_object(pair.1)?;
+                                            peer_id = Some(range_to_array(&s));
+                                        }
+                                        (b"ip", _) => {
+                                            let s = String::decode_bencode_object(pair.1)?;
+                                            ip = Some(s.parse::<IpAddr>()?);
+                                        }
+                                        (b"port", _) => {
+                                            port = Some(u16::decode_bencode_object(pair.1)?);
+                                        }
+                                        _ => {}
+                                    }
                                 }
-                                (b"id", _) => {
-                                    peer.ip = String::decode_bencode_object(pair.1)?;
-                                }
-                                (b"port", _) => {
-                                    peer.port = u32::decode_bencode_object(pair.1)?.to_string();
-                                }
-                                _ => {}
+                                let peer = Peer {
+                                    // Unwrapping because all values have to be initialized before
+                                    // continuing.
+                                    id: Some(peer_id.unwrap()),
+                                    addr: SocketAddr::from((ip.unwrap(), port.unwrap())),
+                                };
+                                peers.push(peer);
                             }
-                            peers.push(peer);
                         }
-                    } else if let Object::Bytes(bytes) = pair.1 {
-                        peers = bytes
-                            .windows(6)
-                            .map(|s| Peer {
-                                id: "".to_string(),
-                                ip: s[0..=4]
-                                    .iter()
-                                    .map(|x| x.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join("."),
-                                port: s[4..]
-                                    .iter()
-                                    .map(|x| x.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(""),
-                            })
-                            .collect::<Vec<Peer>>();
-                    };
+                        Object::Bytes(bytes) => {
+                            assert_eq!(bytes.len() % 6, 0);
+
+                            for chunk in bytes.chunks(6) {
+                                let ip = Ipv4Addr::from(range_to_array(&chunk[..4]));
+                                let port = u16::from_be_bytes(range_to_array(&chunk[4..]));
+
+                                let peer = Peer {
+                                    id: None,
+                                    addr: SocketAddr::from((ip, port)),
+                                };
+
+                                peers.push(peer);
+                            }
+                        }
+                        _ => {
+                            panic!();
+                        }
+                    }
                     resp.peers = peers;
                 }
                 _ => {}
@@ -348,9 +385,7 @@ impl FromBencode for HttpResponse {
 impl FromBencode for ScrapeResponse {
     const EXPECTED_RECURSION_DEPTH: usize = 5;
 
-    fn decode_bencode_object(
-        object: bendy::decoding::Object,
-    ) -> Result<Self, bendy::decoding::Error>
+    fn decode_bencode_object(object: bendy::decoding::Object) -> Result<Self, DecodingError>
     where
         Self: Sized,
     {
@@ -383,19 +418,5 @@ impl FromBencode for ScrapeResponse {
             }
         }
         Ok(Self { files: result })
-    }
-}
-
-impl ToBencode for Extension {
-    const MAX_DEPTH: usize = 3;
-
-    fn encode(&self, encoder: SingleItemEncoder) -> Result<(), Error> {
-        let mut extensions = Encoder::new();
-        extensions.emit_and_sort_dict(|mut e| e.emit_pair(b"ut_metadata", 3))?;
-
-        encoder.emit_dict(|mut e| {
-            e.emit_pair(b"m", extensions.get_output()?);
-            e.emit_pair(b"metadata_size", 31235)
-        })
     }
 }

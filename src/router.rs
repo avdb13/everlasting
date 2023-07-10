@@ -1,6 +1,6 @@
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
-use crate::{data::MagnetInfo, helpers::udp_to_ip};
+use crate::{helpers::udp_to_ip, magnet::MagnetInfo};
 use color_eyre::Report;
 use dashmap::DashMap;
 use futures::{future::BoxFuture, stream::FuturesUnordered, FutureExt, StreamExt};
@@ -28,14 +28,14 @@ pub enum State {
     Scraped,
 }
 
-pub struct Tracker {
+pub struct UdpTracker {
     pub trackers: DashMap<SocketAddr, Session>,
     pub socket: Arc<UdpSocket>,
 
     pub hash: [u8; 20],
 }
 
-impl Tracker {
+impl UdpTracker {
     pub fn new(
         magnet: &MagnetInfo,
         socket: Arc<UdpSocket>,
@@ -43,6 +43,8 @@ impl Tracker {
     ) -> Result<Self, Report> {
         let trackers = magnet
             .trackers
+            .clone()
+            .unwrap()
             .iter()
             .flat_map(|s| {
                 let s = udp_to_ip(s)?;
@@ -124,7 +126,7 @@ impl Session {
             }
         }
 
-        Err(GeneralError::InvalidTracker(self.dst.to_string()).into())
+        Err(GeneralError::InvalidUdpTracker(self.dst.to_string()).into())
     }
 
     // TODO: make this recursive

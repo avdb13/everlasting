@@ -4,6 +4,7 @@ use bendy::{
     decoding::{self, Decoder, FromBencode, Object},
     encoding::{self, AsString, Encoder, SingleItemEncoder, ToBencode},
 };
+use rand::Rng;
 
 use crate::dht::Node;
 
@@ -24,9 +25,10 @@ pub struct ExtMessage {
 
 impl From<Message> for ExtMessage {
     fn from(inner: Message) -> ExtMessage {
+        let transaction_id = rand::thread_rng().gen::<[char; 2]>().iter().collect();
         ExtMessage {
             inner,
-            transaction_id: String::new(),
+            transaction_id,
         }
     }
 }
