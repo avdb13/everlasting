@@ -56,8 +56,13 @@ impl FromBencode for TorrentInfo {
                         md.announce.http.push(s.clone());
                     }
                     if s.starts_with("udp") {
-                        let addr = s.to_socket_addrs()?.collect();
-                        md.announce.udp.push(addr);
+                        let url = Url::parse(&s)?;
+                        let host = url.host().unwrap();
+                        let port = url.port().unwrap();
+
+                        if let Ok(mut addr) = (host.to_string(), port).to_socket_addrs() {
+                            md.announce.udp.push(addr.next().unwrap());
+                        }
                     }
                 }
                 (b"announce-list", list) => {
@@ -79,10 +84,9 @@ impl FromBencode for TorrentInfo {
                                 let host = url.host().unwrap();
                                 let port = url.port().unwrap();
 
-                                let addr = (host.to_string(), port).to_socket_addrs()?;
-                                debug!(?addr);
-
-                                md.announce.udp.push(addr.collect());
+                                if let Ok(mut addr) = (host.to_string(), port).to_socket_addrs() {
+                                    md.announce.udp.push(addr.next().unwrap());
+                                }
                             }
                         }
                     }
@@ -102,17 +106,14 @@ impl FromBencode for TorrentInfo {
 
                 (b"piece length", _) => {
                     let i = u64::decode_bencode_object(pair.1)?;
-                    dbg!("piece length: {}", i);
                     md.info.piece_length = i;
                 }
                 (b"pieces", _) => {
                     let pieces = pair.1.try_into_bytes()?;
-                    dbg!(&pieces.len());
                     let pieces: Vec<_> = pieces
                         .chunks(pieces.len() / SHA1_LEN)
                         .map(|x| range_to_array(&x[0..=20]))
                         .collect();
-                    dbg!(&pieces.len());
                     md.info.pieces = pieces;
                 }
                 (b"nodes", _) => {
@@ -408,8 +409,7 @@ impl FromBencode for ScrapeResponse {
                             status.leechers = u32::decode_bencode_object(pair.1)?;
                         }
                         (b"downloaded", _) => {
-                            let err = u32::decode_bencode_object(pair.1);
-                            dbg!(err.unwrap());
+                            let err = u32::decode_bencode_object(pair.1)?;
                         }
                         _ => {}
                     }

@@ -6,6 +6,7 @@ use crate::udp::Response;
 
 pub type SocketResponse = (Response, SocketAddr);
 
+#[derive(Debug, Clone)]
 pub enum Event {
     None = 0,
     Completed,
@@ -25,8 +26,8 @@ pub enum GeneralError {
     InvalidMagnet(String),
     #[error("no active trackers for this torrent")]
     DeadUdpTrackers,
-    #[error("timeout")]
-    Timeout,
+    #[error("timeout from remote address: {0:?}")]
+    Timeout(Option<SocketAddr>),
     #[error("reconnect")]
     Reconnect,
     #[error("unexpected response: {0}")]
@@ -40,7 +41,7 @@ pub const SHA1_LEN: usize = 20;
 
 #[derive(Default, Debug, PartialEq, Clone)]
 pub struct Announce {
-    pub udp: Vec<Vec<SocketAddr>>,
+    pub udp: Vec<SocketAddr>,
     pub http: Vec<String>,
 }
 
@@ -110,6 +111,15 @@ pub struct Peer {
 }
 
 pub type Peers = Vec<Peer>;
+
+impl From<&SocketAddr> for Peer {
+    fn from(addr: &SocketAddr) -> Self {
+        Peer {
+            id: None,
+            addr: *addr,
+        }
+    }
+}
 
 #[derive(Default, Debug, PartialEq)]
 pub struct HttpResponse {

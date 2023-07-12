@@ -5,7 +5,6 @@ use chrono::Utc;
 use color_eyre::Report;
 use lazy_static::lazy_static;
 use rand::Rng;
-use redb::TableDefinition;
 use tokio::{net::UdpSocket, sync::Mutex, task::JoinSet};
 use tracing::debug;
 

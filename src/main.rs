@@ -1,10 +1,11 @@
 use crate::magnet::MagnetInfo;
+use crate::tracker::UdpTracker;
 use bendy::decoding::FromBencode;
 use data::{File, GeneralError, TorrentInfo};
 use dht::bootstrap_dht;
 use lazy_static::lazy_static;
+use rand::distributions::Alphanumeric;
 use rand::Rng;
-use router::UdpTracker;
 use std::sync::Arc;
 use tracker::HttpTracker;
 use url::Url;
@@ -28,6 +29,7 @@ use tracing::debug;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub mod app;
+pub mod async_joinset;
 pub mod bencode;
 pub mod data;
 pub mod dht;
@@ -36,7 +38,6 @@ pub mod helpers;
 pub mod krpc;
 pub mod magnet;
 pub mod peer;
-pub mod router;
 pub mod scrape;
 pub mod socket;
 pub mod state;
@@ -47,11 +48,22 @@ pub mod udp;
 pub mod writer;
 
 lazy_static! {
-    static ref PEER_ID: [u8; 20] = rand::thread_rng().gen();
     static ref BITTORRENT_PORT: u16 = 1317;
+    static ref PEER_ID_PREFIX: &'static str = "XV";
+    static ref SUFFIX: Vec<char> = rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(16)
+        .map(Into::<char>::into)
+        .collect();
+    static ref PEER_ID: [u8; 20] = format!(
+        "-XV{}-{}",
+        SUFFIX[..4].iter().collect::<String>(),
+        SUFFIX[4..].iter().collect::<String>()
+    )
+    .as_bytes()
+    .try_into()
+    .unwrap();
 }
-
-pub const PEER_ID_PREFIX: &str = "xv";
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
@@ -76,12 +88,11 @@ async fn main() -> Result<(), Report> {
     let torrent = std::fs::read("/home/mikoto/everlasting/test.torrent")?;
     let torrent_info = TorrentInfo::from_bencode(&torrent).unwrap();
 
-    let (tracker, mut peer_rx) = HttpTracker::new(&torrent_info);
+    let (tracker, peer_rx) = HttpTracker::new(&torrent_info);
     tokio::spawn(tracker.run(torrent_info.clone()));
 
-    while let Some(v) = peer_rx.recv().await {
-        debug!(?v);
-    }
+    let router = Router::new(torrent_info, peer_rx);
+    router.run().await;
 
     Ok(())
 }

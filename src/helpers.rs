@@ -1,8 +1,14 @@
+use color_eyre::Report;
+use futures_util::{future::BoxFuture, Future};
 use std::{
     borrow::Cow,
     net::{SocketAddr, ToSocketAddrs},
+    thread::sleep,
+    time::Duration,
 };
 use url::Url;
+
+use crate::data::{self, GeneralError};
 
 pub fn prettier(s: String) -> String {
     s.chars()
@@ -44,9 +50,20 @@ pub fn encode(arr: &[u8]) -> String {
         .collect()
 }
 
-pub fn udp_to_ip<S: AsRef<str>>(s: S) -> Option<SocketAddr> {
-    let url: Url = Url::parse(s.as_ref()).ok()?;
+pub async fn attempt<T, F, C>(func: C, count: u8, interval: u8) -> Result<T, Report>
+where
+    C: Fn() -> F,
+    F: Future<Output = Result<T, Report>>,
+{
+    for _ in 0..count {
+        match func().await {
+            Ok(res) => return Ok(res),
+            Err(_) => {
+                sleep(Duration::from_secs(interval.into()));
+                continue;
+            }
+        }
+    }
 
-    let (addr, port) = (url.host_str()?, url.port()?);
-    (addr, port).to_socket_addrs().ok()?.next()
+    Err(GeneralError::Timeout(None).into())
 }

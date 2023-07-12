@@ -2,12 +2,16 @@ use async_trait::async_trait;
 use bendy::decoding::FromBencode;
 use color_eyre::Report;
 use dashmap::DashMap;
-use rand::Rng;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use futures_util::{FutureExt, TryFutureExt};
+use rand::{seq::SliceRandom, Rng};
+use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     net::UdpSocket,
     sync::mpsc,
-    sync::watch,
+    sync::{
+        mpsc::{Receiver, Sender},
+        watch,
+    },
     time::{sleep, timeout},
 };
 use tracing::debug;
@@ -22,49 +26,9 @@ use crate::{
 
 pub struct HttpSession {
     param_rx: watch::Receiver<Parameters>,
-    peer_tx: mpsc::Sender<Peers>,
+    peer_tx: Sender<Peers>,
     socket: reqwest::Client,
     dst: String,
-}
-
-pub struct UdpSession {
-    socket: UdpSocket,
-    dst: SocketAddr,
-}
-
-pub struct Parameters {
-    pub info_hash: [u8; 20],
-    pub peer_id: [u8; 20],
-    pub port: u16,
-    pub up_down_left: (u64, u64, u64),
-    // some trackers only support compact responses
-    pub compact: bool,
-    pub no_peer_id: bool,
-    pub event: Event,
-    pub ip: Option<SocketAddr>,
-    pub numwant: u8,
-    pub key: Option<()>,
-    pub tracker_id: Option<String>,
-    pub extensions: Option<()>,
-}
-
-impl From<&TorrentInfo> for Parameters {
-    fn from(torrent: &TorrentInfo) -> Self {
-        Parameters {
-            info_hash: torrent.info.value,
-            peer_id: *PEER_ID,
-            port: *BITTORRENT_PORT,
-            up_down_left: (0, 0, torrent.length()),
-            compact: false,
-            no_peer_id: false,
-            event: Event::None,
-            ip: None,
-            numwant: 50,
-            key: None,
-            tracker_id: None,
-            extensions: None,
-        }
-    }
 }
 
 impl HttpSession {
@@ -109,18 +73,20 @@ impl HttpSession {
 
         let mut url = Url::parse(&self.dst)?;
         url.set_query(Some(&queries));
-        debug!("{:?}", url.to_string());
         Ok(url)
     }
 
     async fn get(&self, parameters: &Parameters) -> Result<HttpResponse, Report> {
         let url = self.build_request(parameters).await?;
+        let f = || self.socket.get(url.clone()).send().map_err(Report::from);
 
-        let resp = self.socket.get(url).send().await?;
+        let resp: reqwest::Response = helpers::attempt(f, 4, 1).await?;
         let bytes = resp.bytes().await?;
 
-        let bencode = HttpResponse::from_bencode(&bytes).unwrap();
-        Ok(bencode)
+        match HttpResponse::from_bencode(&bytes) {
+            Ok(resp) => Ok(resp),
+            Err(_) => Err(GeneralError::UnexpectedResponse(url.to_string()).into()),
+        }
     }
 
     pub async fn run(self, torrent: TorrentInfo) {
@@ -146,152 +112,145 @@ impl HttpSession {
     }
 }
 
-// impl UdpSession {
-//     fn new(socket: UdpSocket, dst: SocketAddr) -> Self {
-//         Self { socket, dst }
-//     }
+pub struct UdpSession {
+    resp_rx: Receiver<Response>,
+    peer_tx: Sender<Peers>,
+    socket: Arc<UdpSocket>,
+    dst: SocketAddr,
+}
 
-//     async fn try_connect(&self) -> Result<(), Report> {
-//         let tid = rand::thread_rng().gen::<i32>();
-//         let packet = Request::Connect {
-//             cid: PROTOCOL_ID,
-//             action: 0_i32,
-//             tid,
-//         };
+impl UdpSession {
+    pub fn new(
+        socket: Arc<UdpSocket>,
+        dst: SocketAddr,
+        resp_rx: Receiver<Response>,
+        peer_tx: Sender<Peers>,
+    ) -> Self {
+        debug!(?dst);
+        Self {
+            resp_rx,
+            peer_tx,
+            socket,
+            dst,
+        }
+    }
 
-//         timeout(Duration::from_secs(15), self.dispatch(packet)).await?
-//     }
-// }
+    async fn connect(&mut self) -> Result<Response, Report> {
+        let tid = rand::thread_rng().gen();
 
-// pub async fn dispatch(&mut self, packet: Request) -> Result<Response, Report> {
-//     // If no response to a request is received within 15 seconds, resend the request.
-//     // If no reply has been received after 60 seconds, stop retrying.
+        let packet = Request::Connect {
+            cid: PROTOCOL_ID,
+            action: 0_i32,
+            tid,
+        };
 
-//     for _ in 0..4 {
-//         match self.socket.send_to(packet.to_request()).await {
-//             Ok(_) => {
-//                 debug!("socket [{}] sent request: {:?}", self.1, &packet);
+        self.dispatch(packet).await?;
+        let resp = self
+            .resp_rx
+            .recv()
+            .await
+            .ok_or(GeneralError::Timeout(None))?;
 
-//                 let resp = self.rx.recv().await.ok_or(GeneralError::Timeout)?;
+        Ok(resp)
+    }
 
-//                 debug!("socket [{}] received response: {:?}", self.dst.ip(), resp,);
+    pub async fn dispatch(&mut self, packet: Request) -> Result<Response, Report> {
+        let e = GeneralError::Timeout(Some(self.dst));
 
-//                 return Ok(resp);
-//             }
-//             Err(e) => match e.kind() {
-//                 ErrorKind::WouldBlock => continue,
-//                 _ => return Err(e.into()),
-//             },
-//         }
-//     }
+        for _ in 0..4 {
+            // increase chance of success by randomly choosing another IP at every invocation
+            match self.socket.send_to(&packet.to_request(), self.dst).await {
+                Ok(_) => {
+                    debug!("socket [{}] sent request: {:?}", self.dst, &packet);
+                    let resp = self.resp_rx.recv().await.ok_or(e)?;
+                    debug!("socket [{}] received response: {:?}", self.dst.ip(), resp);
 
-//     Ok(())
-// }
-// }
+                    return Ok(resp);
+                }
+                Err(e) => match e.kind() {
+                    ErrorKind::WouldBlock => continue,
+                    _ => return Err(e.into()),
+                },
+            }
+        }
 
-// #[async_trait]
-// pub trait Socket {
-// async fn try_connect(&self) -> Result<(), Report>;
-// async fn send(&self, message: Vec<u8>) -> Result<usize, Report>;
-// }
+        Err(e.into())
+    }
 
-// #[async_trait]
-// impl Socket for UdpSocket {
-// async fn send(&self, message: Vec<u8>) -> Result<usize, Report> {
-//     self.0
-//         .clone()
-//         .send_to(message.as_slice(), self.1)
-//         .await
-//         .map_err(|e| e.into())
-// }
-// }
+    pub async fn announce(&mut self, cid: i64, torrent: &TorrentInfo) -> Result<Response, Report> {
+        let peer_id = rand::thread_rng().gen::<[u8; 20]>();
+        let key = rand::thread_rng().gen::<u32>();
+        let info_hash = torrent.info.value;
 
-// pub struct UdpTracker {
-//     pub socket: Box<dyn Socket>,
-//     pub session_map: DashMap<SocketAddr, Session>,
-//     pub hash: [u8; 20],
-// }
+        let packet = Request::Announce {
+            cid,
+            action: 1i32,
+            tid: rand::thread_rng().gen::<i32>(),
+            info_hash,
+            peer_id,
+            up_down_left: (0, 0, torrent.length() as i64),
+            event: Event::None,
+            socket: self.socket.local_addr().unwrap(),
+            key,
+            num_want: -1i32,
+            extensions: 0u16,
+        };
 
-// pub struct UdpSession {
-//     pub state: State,
-//     pub rx: Receiver<Response>,
-//     pub socket: Arc<UdpSocket>,
-//     pub dst: SocketAddr,
-//     pub hash: [u8; 20],
+        timeout(Duration::from_secs(3), self.dispatch(packet)).await?
+    }
 
-//     pub retries: usize,
-//     pub timeout: usize,
-// }
+    pub async fn run(mut self, torrent: &TorrentInfo) -> Result<(), Report> {
+        if let Response::Connect { cid, .. } = self.connect().await? {
+            for _ in 0..4 {
+                match self.announce(cid, torrent).await? {
+                    Response::Connect { .. } => {
+                        continue;
+                    }
+                    Response::Announce { peers, .. } => {
+                        self.peer_tx
+                            .send(peers.iter().map(Into::into).collect())
+                            .await?;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
-// impl UdpSession {
-//     pub fn new(
-//         hash: [u8; 20],
-//         dst: SocketAddr,
-//         socket: Arc<UdpSocket>,
-//         rx: Receiver<Response>,
-//     ) -> Self {
-//         Self {
-//             state: State::Disconnected,
-//             rx,
-//             socket,
-//             dst,
-//             hash,
-//             retries: 3,
-//             timeout: 5,
-//         }
-//     }
+        Err(GeneralError::Reconnect.into())
+    }
+}
 
-//         Err(GeneralError::InvalidUdpTracker(self.dst.to_string()).into())
-//     }
+pub struct Parameters {
+    pub info_hash: [u8; 20],
+    pub peer_id: [u8; 20],
+    pub port: u16,
+    pub up_down_left: (u64, u64, u64),
+    // some trackers only support compact responses
+    pub compact: bool,
+    pub no_peer_id: bool,
+    pub event: Event,
+    pub ip: Option<SocketAddr>,
+    pub numwant: u8,
+    pub key: Option<()>,
+    pub tracker_id: Option<String>,
+    pub extensions: Option<()>,
+}
 
-//     // TODO: make this recursive
-//     pub async fn connect(&mut self) -> Result<Response, Report> {
-//         let tid = rand::thread_rng().gen::<i32>();
-//         let packet = Request::Connect {
-//             cid: PROTOCOL_ID,
-//             action: 0_i32,
-//             tid,
-//         };
-
-//         timeout(Duration::from_secs(3), self.dispatch(packet)).await?
-//     }
-
-//     pub async fn announce(&mut self, cid: i64) -> Result<Response, Report> {
-//         let peer_id = rand::thread_rng().gen::<[u8; 20]>();
-//         let key = rand::thread_rng().gen::<u32>();
-
-//         let packet = Request::Announce {
-//             cid,
-//             action: 1i32,
-//             tid: rand::thread_rng().gen::<i32>(),
-//             hash: self.hash,
-//             peer_id,
-//             downloaded: 0,
-//             left: 0,
-//             uploaded: 0,
-//             event: TransferEvent::Inactive,
-//             socket: self.socket.local_addr().unwrap(),
-//             key,
-//             num_want: -1i32,
-//             extensions: 0u16,
-//         };
-
-//         timeout(Duration::from_secs(3), self.dispatch(packet)).await?
-//     }
-//     pub async fn resolve(mut self) -> Option<Vec<SocketAddr>> {
-//         if let Response::Connect { cid, .. } = self.connect().await.ok()? {
-//             for _ in 0..self.retries {
-//                 match self.announce(cid).await.ok()? {
-//                     Response::Connect { action, tid, cid } => {
-//                         // sleep(Duration::from_secs(1)).await;
-//                         continue;
-//                     }
-//                     Response::Announce { peers, .. } => return Some(peers),
-//                     _ => return None,
-//                 }
-//             }
-//             None
-//         } else {
-//             None
-//         }
-//     }
+impl From<&TorrentInfo> for Parameters {
+    fn from(torrent: &TorrentInfo) -> Self {
+        Parameters {
+            info_hash: torrent.info.value,
+            peer_id: *PEER_ID,
+            port: *BITTORRENT_PORT,
+            up_down_left: (0, 0, torrent.length()),
+            compact: false,
+            no_peer_id: false,
+            event: Event::None,
+            ip: None,
+            numwant: 50,
+            key: None,
+            tracker_id: None,
+            extensions: None,
+        }
+    }
+}

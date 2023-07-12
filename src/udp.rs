@@ -3,6 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use color_eyre::Report;
 use tracing::debug;
 
+use crate::data::Event;
+
 #[derive(Clone, Debug)]
 pub enum Request {
     Connect {
@@ -14,12 +16,10 @@ pub enum Request {
         cid: i64,
         action: i32,
         tid: i32,
-        hash: [u8; 20],
+        info_hash: [u8; 20],
         peer_id: [u8; 20],
-        downloaded: i64,
-        left: i64,
-        uploaded: i64,
-        event: TransferEvent,
+        up_down_left: (i64, i64, i64),
+        event: Event,
         socket: SocketAddr,
         key: u32,
         num_want: i32,
@@ -129,11 +129,9 @@ impl Request {
                 cid,
                 action,
                 tid,
-                hash,
+                info_hash,
                 peer_id,
-                downloaded,
-                left,
-                uploaded,
+                up_down_left,
                 event,
                 socket,
                 key,
@@ -144,11 +142,11 @@ impl Request {
                     cid.to_be_bytes().to_vec(),
                     action.to_be_bytes().to_vec(),
                     tid.to_be_bytes().to_vec(),
-                    hash.to_vec(),
+                    info_hash.to_vec(),
                     peer_id.to_vec(),
-                    downloaded.to_be_bytes().to_vec(),
-                    left.to_be_bytes().to_vec(),
-                    uploaded.to_be_bytes().to_vec(),
+                    up_down_left.0.to_be_bytes().to_vec(),
+                    up_down_left.2.to_be_bytes().to_vec(),
+                    up_down_left.1.to_be_bytes().to_vec(),
                     [0, 0, 0, 0].to_vec(),
                     [0, 0, 0, 0].to_vec(),
                     key.to_be_bytes().to_vec(),
@@ -179,12 +177,4 @@ pub struct Status {
     complete: i32,
     downloaded: i32,
     incomplete: i32,
-}
-
-#[derive(Debug, Clone)]
-pub enum TransferEvent {
-    Inactive = 0,
-    Completed,
-    Started,
-    Stopped,
 }
