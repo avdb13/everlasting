@@ -29,7 +29,6 @@ use tracing::debug;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub mod app;
-pub mod async_joinset;
 pub mod bencode;
 pub mod data;
 pub mod dht;
@@ -91,8 +90,10 @@ async fn main() -> Result<(), Report> {
     let (tracker, peer_rx) = HttpTracker::new(&torrent_info);
     tokio::spawn(tracker.run(torrent_info.clone()));
 
-    let router = Router::new(torrent_info, peer_rx);
-    router.run().await;
+    let router = Router::new(torrent_info.clone(), peer_rx);
+    router.run(torrent_info).await;
+
+    loop {}
 
     Ok(())
 }

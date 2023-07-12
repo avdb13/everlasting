@@ -83,7 +83,11 @@ impl UdpTracker {
             set.spawn(async move { session.run(&torrent).await });
         }
 
-        tokio::spawn(async move { while let Some(_) = set.join_next().await {} });
+        tokio::spawn(async move {
+            while set.join_next().await.is_some() {
+                debug!("joined a session!");
+            }
+        });
 
         Ok(())
     }

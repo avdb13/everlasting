@@ -1,4 +1,5 @@
 use bendy::encoding::ToBencode;
+use futures_util::Future;
 use std::{
     collections::HashMap,
     io::ErrorKind,
@@ -52,42 +53,34 @@ impl Router {
         }
     }
 
-    pub async fn run(self) {
-        debug!("sending handshakes to peers");
+    pub async fn run(self, torrent: TorrentInfo) {
+        let mut rx = Router::connect(self.peer_rx, torrent).await;
 
-        let mut handshake_rx = Router::connect(self.peer_rx, self.torrent.clone()).await;
-
-        while let Some((mut conn, (reader, conn_tx, peer))) = handshake_rx.recv().await {
-            debug!("handling connection ");
-            tokio::spawn(Connection::listen(reader, conn_tx, peer.clone()));
-            conn.handle(peer).await;
+        while let Some((task, peer)) = rx.recv().await {
+            let f = async move {
+                if let Ok(mut conn) = task.await {
+                    conn.handle(peer.clone()).await;
+                }
+            };
+            tokio::spawn(f);
         }
     }
 
     pub async fn connect(
         mut peer_rx: Receiver<Peers>,
         torrent: TorrentInfo,
-    ) -> Receiver<ExtConnection> {
+    ) -> Receiver<(impl Future<Output = Result<Connection, Report>>, Peer)> {
         let (tx, rx) = mpsc::channel(100);
 
         // send connections back from peers that are beyond the handshake
         tokio::spawn(async move {
             while let Some(peers) = peer_rx.recv().await {
-                debug!(peers = ?peers.iter().map(|p| p.addr).collect::<Vec<_>>());
-
                 for peer in peers.into_iter() {
                     let handshake = Handshake::new(torrent.info.value);
 
-                    let stream = Router::handshake(peer.clone(), &handshake).await;
-
-                    if let Ok(stream) = stream {
-                        let (reader, writer) = split(stream);
-                        let (conn_tx, conn_rx) = mpsc::channel(100);
-
-                        tx.send((Connection::new(writer, conn_rx), (reader, conn_tx, peer)))
-                            .await
-                            .unwrap();
-                    }
+                    let _ = tx
+                        .send((Router::handshake(peer.clone(), handshake.clone()), peer))
+                        .await;
                 }
             }
         });
@@ -95,7 +88,7 @@ impl Router {
         rx
     }
 
-    pub async fn handshake(peer: Peer, handshake: &Handshake<'_>) -> Result<TcpStream, Report> {
+    pub async fn handshake(peer: Peer, handshake: Handshake<'_>) -> Result<Connection, Report> {
         let mut stream = timeout(Duration::from_secs(3), TcpStream::connect(peer.addr)).await??;
 
         stream.write_all(&handshake.to_request()).await?;
@@ -117,7 +110,13 @@ impl Router {
             _ => return Err(GeneralError::Timeout(Some(peer.addr)).into()),
         };
 
-        Ok(stream)
+        let (reader, writer) = split(stream);
+        let (conn_tx, conn_rx) = mpsc::channel(100);
+
+        let conn = Connection::new(writer, conn_rx);
+        tokio::spawn(Connection::listen(reader, conn_tx, peer.clone()));
+
+        Ok(conn)
     }
 }
 
