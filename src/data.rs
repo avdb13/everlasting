@@ -34,6 +34,8 @@ pub enum GeneralError {
     UnexpectedResponse(String),
     #[error("failed to parse URL: {0}")]
     ParseFailure(String),
+    #[error("broken pipe")]
+    BrokenPipe,
 }
 
 pub const PROTOCOL_ID: i64 = 0x41727101980;

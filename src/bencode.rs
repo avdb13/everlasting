@@ -18,7 +18,10 @@ use tracing::debug;
 use url::Url;
 
 use crate::{
-    data::{File, HttpResponse, Info, Mode, Peer, ScrapeResponse, Status, TorrentInfo, SHA1_LEN},
+    data::{
+        File, GeneralError, HttpResponse, Info, Mode, Peer, ScrapeResponse, Status, TorrentInfo,
+        SHA1_LEN,
+    },
     helpers::range_to_array,
 };
 
@@ -81,8 +84,8 @@ impl FromBencode for TorrentInfo {
                             }
                             if s.starts_with("udp") {
                                 let url = Url::parse(&s)?;
-                                let host = url.host().unwrap();
-                                let port = url.port().unwrap();
+                                let host = url.host().ok_or(GeneralError::InvalidUdpTracker(s))?;
+                                let port = url.port().unwrap_or(80);
 
                                 if let Ok(mut addr) = (host.to_string(), port).to_socket_addrs() {
                                     md.announce.udp.push(addr.next().unwrap());

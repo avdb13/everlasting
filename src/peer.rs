@@ -1,15 +1,20 @@
 use bendy::encoding::ToBencode;
+use bytes::{Buf, BytesMut};
 use futures_util::Future;
 use std::{
     collections::HashMap,
-    io::ErrorKind,
+    fmt,
+    io::{Cursor, ErrorKind},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
 use tokio::{
-    net::{TcpStream, UdpSocket},
-    sync::mpsc::{self, channel, Receiver, Sender},
+    net::{
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+        TcpStream, UdpSocket,
+    },
+    sync::mpsc::{self, channel, Receiver, Sender, UnboundedReceiver},
     task::JoinSet,
 };
 
@@ -17,7 +22,7 @@ use color_eyre::{owo_colors::OwoColorize, Report};
 use rand::Rng;
 
 use tokio::{
-    io::{self, split, AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf},
+    io::{self, split, AsyncReadExt, AsyncWriteExt},
     time::{sleep, timeout},
 };
 use tracing::{debug, error, field::debug, info};
@@ -26,15 +31,13 @@ use crate::{
     data::{GeneralError, Peer, Peers, TorrentInfo},
     dht::Node,
     extensions::ExtensionHeader,
+    framing::{FrameReader, ParseCheck, ParseError},
     helpers::{self, decode, range_to_array},
     krpc::{self, Arguments, ExtMessage, Method},
     magnet::MagnetInfo,
     udp::{Request, Response},
     PEER_ID,
 };
-
-type Bitfield = Vec<u8>;
-type ExtConnection = (Connection, (ReadHalf<TcpStream>, Sender<Message>, Peer));
 
 pub struct Router {
     pub torrent: TorrentInfo,
@@ -69,18 +72,21 @@ impl Router {
     pub async fn connect(
         mut peer_rx: Receiver<Peers>,
         torrent: TorrentInfo,
-    ) -> Receiver<(impl Future<Output = Result<Connection, Report>>, Peer)> {
-        let (tx, rx) = mpsc::channel(100);
+    ) -> UnboundedReceiver<(impl Future<Output = Result<Connection, Report>>, Peer)> {
+        let (tx, rx) = mpsc::unbounded_channel();
 
         // send connections back from peers that are beyond the handshake
         tokio::spawn(async move {
+            let pieces = torrent.info.pieces.len();
+            let handshake = Arc::new(Handshake::new(torrent.info.value));
+
             while let Some(peers) = peer_rx.recv().await {
                 for peer in peers.into_iter() {
-                    let handshake = Handshake::new(torrent.info.value);
-
-                    let _ = tx
-                        .send((Router::handshake(peer.clone(), handshake.clone()), peer))
-                        .await;
+                    tx.send((
+                        Router::handshake(peer.clone(), handshake.clone(), pieces),
+                        peer,
+                    ))
+                    .unwrap();
                 }
             }
         });
@@ -88,76 +94,64 @@ impl Router {
         rx
     }
 
-    pub async fn handshake(peer: Peer, handshake: Handshake<'_>) -> Result<Connection, Report> {
-        let mut stream = timeout(Duration::from_secs(3), TcpStream::connect(peer.addr)).await??;
+    pub async fn handshake(
+        peer: Peer,
+        handshake: Arc<Handshake>,
+        pieces: usize,
+    ) -> Result<Connection, Report> {
+        let stream = timeout(Duration::from_secs(3), TcpStream::connect(peer.addr)).await??;
+        let (r, mut w) = stream.into_split();
 
-        stream.write_all(&handshake.to_request()).await?;
-        stream.flush().await?;
+        let (conn_tx, conn_rx) = mpsc::channel(100);
+        tokio::spawn(Connection::listen(r, conn_tx));
+
+        w.write_all(&handshake.to_request()).await?;
         debug!("handshake was sent to [{}] ...", peer.addr);
 
-        // <1:pstrlen><19:pstr><8:reserved><20:info_hash><20:peer_id>
-        let mut buf = [0u8; 68];
-
-        match timeout(Duration::from_secs(3), stream.read_exact(&mut buf)).await? {
-            Ok(n) if n == buf.len() => {
-                debug!("[{}] received the handshake ...", peer.addr);
-                let handshake = Handshake::from_response(&buf);
-
-                if handshake.reserved[7] | 0x01 == 1 {
-                    debug!("supports DHT: [{}]", peer.addr);
-                }
-            }
-            _ => return Err(GeneralError::Timeout(Some(peer.addr)).into()),
-        };
-
-        let (reader, writer) = split(stream);
-        let (conn_tx, conn_rx) = mpsc::channel(100);
-
-        let conn = Connection::new(writer, conn_rx);
-        tokio::spawn(Connection::listen(reader, conn_tx, peer.clone()));
-
-        Ok(conn)
+        Ok(Connection::new(w, conn_rx, pieces))
     }
 }
 
 #[derive(Debug)]
 pub struct Connection {
-    pub writer: WriteHalf<TcpStream>,
+    pub writer: OwnedWriteHalf,
+    pub buffer: BytesMut,
     pub rx: Receiver<Message>,
     pub state: State,
     pub dht_port: Option<u16>,
 }
 
 impl Connection {
-    pub fn new(writer: WriteHalf<TcpStream>, rx: Receiver<Message>) -> Self {
+    pub fn new(writer: OwnedWriteHalf, rx: Receiver<Message>, pieces: usize) -> Self {
         Self {
             writer,
             rx,
-            state: State::new(),
+            buffer: BytesMut::new(),
+            state: State::new(pieces),
             dht_port: None,
         }
     }
 
-    pub async fn listen(
-        mut reader: ReadHalf<TcpStream>,
-        tx: Sender<Message>,
-        peer: Peer,
-    ) -> Result<(), Report> {
-        debug!("listening for [{}]", peer.addr);
-        loop {
-            let mut buf = Vec::new();
+    pub async fn listen(r: OwnedReadHalf, tx: Sender<Message>) -> Result<(), Report> {
+        let peer_addr = r.peer_addr()?;
+        let mut reader: FrameReader<Message> = FrameReader::new(r);
 
-            loop {
-                match reader.read_to_end(&mut buf).await {
-                    Ok(_) => break,
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => continue,
-                    Err(e) => return Err(e.into()),
+        while let Some(frame) = reader.read_frame().await? {
+            match frame {
+                Message::Handshake(handshake) => {
+                    debug!("[{}] received the handshake ...", peer_addr);
+                    if handshake.reserved[7] | 0x01 == 1 {
+                        debug!("supports DHT: [{}]", peer_addr);
+                    }
+                }
+                _ => {
+                    debug!("received frame from [{}]", peer_addr);
+                    tx.send(frame).await?;
                 }
             }
-
-            let messages = Message::parse_all(&buf);
-            tx.send(messages[0].clone()).await?;
         }
+
+        Ok(())
     }
 
     pub async fn handle(&mut self, peer: Peer) {
@@ -178,11 +172,13 @@ impl Connection {
                     self.state.interested = false;
                 }
                 Message::Have(idx) => {
-                    let n = self.state.remote_bitfield[idx / 8] as usize;
-                    let missing = n | (idx % 8);
-                    debug!(missing = ?missing);
-                    let n = self.state.remote_bitfield.get_mut(idx / 8).unwrap();
-                    *n |= (idx % 8) as u8;
+                    debug!(idx);
+                    panic!();
+                    // let n = self.state.remote_bitfield[idx / 8] as usize;
+                    // let missing = n | (idx % 8);
+                    // debug!(missing = ?missing);
+                    // let n = self.state.remote_bitfield.get_mut(idx / 8).unwrap();
+                    // *n |= (idx % 8) as u8;
                 }
                 Message::Bitfield(v) => {
                     self.state.remote_bitfield = v;
@@ -220,28 +216,29 @@ pub struct State {
 }
 
 impl State {
-    fn new() -> Self {
+    fn new(pieces: usize) -> Self {
+        let len = (pieces / 8) + 1;
         Self {
             choked: true,
             interested: false,
             peer_choked: true,
             peer_interested: false,
-            remote_bitfield: Vec::new(),
+            remote_bitfield: vec![0; len],
         }
     }
 }
 
 // the peer id will presumably be sent after the recipient sends its own handshake
 #[derive(Clone, Debug)]
-pub struct Handshake<'p> {
+pub struct Handshake {
     pstr: Option<String>,
     reserved: [u8; 8],
     hash: [u8; 20],
     peer_id: [u8; 20],
-    payload: Option<&'p [u8]>,
+    payload: Option<Vec<u8>>,
 }
 
-impl<'p> Handshake<'p> {
+impl Handshake {
     fn new(hash: [u8; 20]) -> Self {
         let mut reserved = [0u8; 8];
 
@@ -272,29 +269,13 @@ impl<'p> Handshake<'p> {
         // let extended_handshake =
         handshake
     }
-    fn from_response(v: &'p [u8]) -> Self {
-        let reserved = range_to_array(&v[20..28]);
-        let hash = range_to_array(&v[28..48]);
-        let peer_id = range_to_array(&v[48..68]);
-        Self {
-            pstr: None,
-            reserved,
-            hash,
-            peer_id,
-            payload: Some(&v[68..]),
-        }
-    }
-
-    // fn validate_response(&self, v: &[u8]) -> bool {
-    //     let (hash, peer_id) = v[1 + 19 + 8..].split_at(20);
-    //     hash == self.hash && peer_id == self.peer_id
-    // }
 }
 
-#[repr(u8)]
-#[derive(Debug, Clone)]
+#[repr(i8)]
+#[derive(Clone)]
 pub enum Message {
-    Choke = 0,
+    Handshake(Handshake) = -1,
+    Choke,
     Unchoke,
     Interested,
     Uninterested,
@@ -319,60 +300,59 @@ pub enum Message {
     Extended = 20,
 }
 
-impl Message {
-    pub fn to_request<V: AsRef<[u8]>>(&self, payload: Option<V>) -> Vec<u8> {
-        let message = if let Some(payload) = payload {
-            [&[self.to_discriminant()], payload.as_ref()].concat()
-        } else {
-            [self.to_discriminant()].to_vec()
-        };
-        [[message.len() as u8].to_vec(), message].concat()
-    }
-
-    pub fn to_discriminant(&self) -> u8 {
-        use Message::*;
-
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Choke => 0,
-            Unchoke => 1,
-            Interested => 2,
-            Uninterested => 3,
-            Have(_) => 4,
-            Bitfield(_) => 5,
-            Request { .. } => 6,
-            Piece { .. } => 7,
-            Cancel { .. } => 8,
-            Port(_) => 9,
-            Extended => 20,
+            Self::Handshake(_) => write!(f, "Handshake"),
+            Self::Choke => write!(f, "Choke"),
+            Self::Unchoke => write!(f, "Unchoke"),
+            Self::Interested => write!(f, "Interested"),
+            Self::Uninterested => write!(f, "Uninterested"),
+            Self::Have(_) => f.debug_tuple("Have").finish(),
+            Self::Bitfield(_) => f.debug_tuple("Bitfield").finish(),
+            Self::Request { .. } => f.debug_struct("Request").finish(),
+            Self::Piece { .. } => f.debug_struct("Piece").finish(),
+            Self::Cancel { .. } => f.debug_struct("Cancel").finish(),
+            Self::Port(_) => f.debug_tuple("Port").finish(),
+            Self::Extended => write!(f, "Extended"),
         }
     }
+}
 
-    fn parse_all(mut v: &[u8]) -> Vec<Message> {
-        let mut res = Vec::new();
+impl ParseCheck for Message {
+    fn check(v: &mut Cursor<&[u8]>) -> Result<(), ParseError> {
+        let n: Vec<_> = (0..4).map_while(|_| Self::get_u8(v)).collect();
+        if n.len() != 4 {
+            return Err(ParseError::Incomplete);
+        }
+        let n = u32::from_be_bytes(n.try_into().unwrap()) as usize;
 
-        while !v.is_empty() {
-            let len = u32::from_be_bytes(range_to_array(&v[..4])) as usize;
-            let msg = Message::parse(&v[4..4 + len], len);
-            v = &v[4 + len..];
-
-            res.push(msg);
+        let rem: Vec<_> = (0..n).map(|_| Self::get_u8(v)).collect();
+        if rem.len() != n {
+            return Err(ParseError::Incomplete);
         }
 
-        res
+        Ok(())
     }
 
-    fn parse(v: &[u8], len: usize) -> Message {
+    fn parse(v: &mut Cursor<&[u8]>) -> Result<Self, ParseError>
+    where
+        Self: Sized,
+    {
         use Message::*;
-        debug!(message_type = v[0]);
 
-        match v[0] {
+        let n: Vec<_> = (0..4).map(|_| v.get_u8()).collect();
+        let n = u32::from_be_bytes(n.try_into().unwrap());
+        let rem: Vec<_> = (0..n).map(|_| v.get_u8()).collect();
+
+        let res = match rem[0] {
             0 => Choke,
             1 => Unchoke,
             2 => Interested,
             3 => Uninterested,
-            4 => Have(usize::from_be_bytes(range_to_array(&v[1..]))),
+            4 => Have(u32::from_be_bytes(rem[1..].try_into().unwrap()) as usize),
             5 => {
-                let payload = v[..len]
+                let payload = rem[..rem.len()]
                     .iter()
                     .flat_map(|n| (0..8).map(|i| (n >> i) & 1).collect::<Vec<_>>())
                     .collect();
@@ -380,9 +360,9 @@ impl Message {
                 Bitfield(payload)
             }
             6 => {
-                let index = u32::from_be_bytes(range_to_array(&v[1..5])) as usize;
-                let begin = u32::from_be_bytes(range_to_array(&v[5..9])) as usize;
-                let length = u32::from_be_bytes(range_to_array(&v[9..13])) as usize;
+                let index = u32::from_be_bytes(rem[1..5].try_into().unwrap()) as usize;
+                let begin = u32::from_be_bytes(rem[5..9].try_into().unwrap()) as usize;
+                let length = u32::from_be_bytes(rem[9..13].try_into().unwrap()) as usize;
 
                 Request {
                     index,
@@ -391,10 +371,10 @@ impl Message {
                 }
             }
             7 => {
-                let index = u32::from_be_bytes(range_to_array(&v[1..5])) as usize;
-                let begin = u32::from_be_bytes(range_to_array(&v[5..9])) as usize;
+                let index = u32::from_be_bytes(rem[1..5].try_into().unwrap()) as usize;
+                let begin = u32::from_be_bytes(rem[5..9].try_into().unwrap()) as usize;
 
-                let block = v[..len].iter().map(|&i| i as usize).collect();
+                let block = rem[..rem.len()].iter().map(|&i| i as usize).collect();
 
                 Piece {
                     index,
@@ -403,9 +383,9 @@ impl Message {
                 }
             }
             8 => {
-                let index = u32::from_be_bytes(range_to_array(&v[1..5])) as usize;
-                let begin = u32::from_be_bytes(range_to_array(&v[5..9])) as usize;
-                let length = u32::from_be_bytes(range_to_array(&v[9..13])) as usize;
+                let index = u32::from_be_bytes(rem[1..5].try_into().unwrap()) as usize;
+                let begin = u32::from_be_bytes(rem[5..9].try_into().unwrap()) as usize;
+                let length = u32::from_be_bytes(rem[9..13].try_into().unwrap()) as usize;
 
                 Cancel {
                     index,
@@ -414,12 +394,62 @@ impl Message {
                 }
             }
             9 => {
-                let port = u16::from_be_bytes(range_to_array(&v[1..3]));
+                let port = u16::from_be_bytes(rem[1..3].try_into().unwrap());
 
                 Port(port)
             }
             20 => Extended,
             _ => panic!(),
-        }
+        };
+
+        Ok(res)
     }
 }
+
+impl ParseCheck for Handshake {
+    // <1:pstrlen><19:pstr><8:reserved><20:info_hash><20:peer_id>
+
+    fn check(v: &mut Cursor<&[u8]>) -> Result<(), ParseError> {
+        let n: Vec<_> = (0..68).map_while(|_| Self::get_u8(v)).collect();
+        if n.len() != 68 {
+            return Err(ParseError::Incomplete);
+        }
+
+        Ok(())
+    }
+
+    fn parse(v: &mut Cursor<&[u8]>) -> Result<Self, ParseError>
+    where
+        Self: Sized,
+    {
+        let rem: Vec<_> = (0..68).map_while(|_| Self::get_u8(v)).collect();
+        if rem.len() != 68 {
+            return Err(ParseError::Incomplete);
+        }
+
+        let reserved = rem[20..28].try_into().unwrap();
+        let hash = rem[28..48].try_into().unwrap();
+        let peer_id = rem[48..68].try_into().unwrap();
+
+        Ok(Self {
+            pstr: None,
+            reserved,
+            hash,
+            peer_id,
+            payload: Some(rem[68..].to_vec()),
+        })
+    }
+}
+
+//impl Message {
+//    pub fn to_request<V: AsRef<[u8]>>(&self, payload: Option<V>) -> Vec<u8> {
+//        // handshake has a different pattern
+//        //
+//        // let message = if let Some(payload) = payload {
+//        //     [&[self.to_discriminant()], payload.as_ref()].concat()
+//        // } else {
+//        //     [self.to_discriminant()].to_vec()
+//        // };
+//        // [[message.len() as u8].to_vec(), message].concat()
+//        Vec::new()
+//    }

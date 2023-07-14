@@ -33,6 +33,7 @@ pub mod bencode;
 pub mod data;
 pub mod dht;
 pub mod extensions;
+pub mod framing;
 pub mod helpers;
 pub mod krpc;
 pub mod magnet;
