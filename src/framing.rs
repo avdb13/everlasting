@@ -31,7 +31,9 @@ where
                 return Ok(Some(res));
             }
 
-            if 0 == self.inner.read_buf(&mut self.buffer).await? {
+            let n = self.inner.read_buf(&mut self.buffer).await?;
+
+            if 0 == n {
                 if self.buffer.is_empty() {
                     return Ok(None);
                 } else {
@@ -44,7 +46,9 @@ where
     fn parse_frame(&mut self) -> Result<Option<T>, Report> {
         let mut buf = Cursor::new(&self.buffer[..]);
 
-        match T::check(&mut buf) {
+        let check = T::check(&mut buf);
+
+        match check {
             Ok(_) => {
                 let len = buf.position() as usize;
                 buf.set_position(0);
@@ -56,6 +60,9 @@ where
             }
             Err(ParseError::Incomplete) => Ok(None),
         }
+    }
+    pub fn take_inner(self) -> OwnedReadHalf {
+        self.inner
     }
 }
 

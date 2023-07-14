@@ -134,21 +134,20 @@ impl Connection {
 
     pub async fn listen(r: OwnedReadHalf, tx: Sender<Message>) -> Result<(), Report> {
         let peer_addr = r.peer_addr()?;
-        let mut reader: FrameReader<Message> = FrameReader::new(r);
 
-        while let Some(frame) = reader.read_frame().await? {
-            match frame {
-                Message::Handshake(handshake) => {
-                    debug!("[{}] received the handshake ...", peer_addr);
-                    if handshake.reserved[7] | 0x01 == 1 {
-                        debug!("supports DHT: [{}]", peer_addr);
-                    }
-                }
-                _ => {
-                    debug!("received frame from [{}]", peer_addr);
-                    tx.send(frame).await?;
-                }
+        let mut reader: FrameReader<Handshake> = FrameReader::new(r);
+        if let Some(handshake) = reader.read_frame().await? {
+            debug!("[{}] received the handshake ...", peer_addr);
+
+            if handshake.reserved[7] | 0x01 == 1 {
+                debug!("supports DHT: [{}]", peer_addr);
             }
+        }
+
+        let mut reader: FrameReader<Message> = FrameReader::new(reader.take_inner());
+        while let Some(frame) = reader.read_frame().await? {
+            debug!("received frame from [{}]", peer_addr);
+            tx.send(frame).await?;
         }
 
         Ok(())
@@ -341,9 +340,16 @@ impl ParseCheck for Message {
     {
         use Message::*;
 
-        let n: Vec<_> = (0..4).map(|_| v.get_u8()).collect();
-        let n = u32::from_be_bytes(n.try_into().unwrap());
-        let rem: Vec<_> = (0..n).map(|_| v.get_u8()).collect();
+        let n: Vec<_> = (0..4).map_while(|_| Self::get_u8(v)).collect();
+        if n.len() != 4 {
+            return Err(ParseError::Incomplete);
+        }
+        let n = u32::from_be_bytes(n.try_into().unwrap()) as usize;
+
+        let rem: Vec<_> = (0..n).map_while(|_| Self::get_u8(v)).collect();
+        if rem.len() != n {
+            return Err(ParseError::Incomplete);
+        }
 
         let res = match rem[0] {
             0 => Choke,
