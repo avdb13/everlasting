@@ -37,6 +37,7 @@ pub mod framing;
 pub mod helpers;
 pub mod krpc;
 pub mod magnet;
+pub mod nameless;
 pub mod peer;
 pub mod scrape;
 pub mod socket;

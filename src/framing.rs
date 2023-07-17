@@ -8,8 +8,8 @@ use tokio::{io::AsyncReadExt, net::tcp::OwnedReadHalf};
 use crate::data::GeneralError;
 
 pub struct FrameReader<T> {
-    inner: OwnedReadHalf,
-    buffer: BytesMut,
+    pub inner: OwnedReadHalf,
+    pub buffer: BytesMut,
     item: PhantomData<T>,
 }
 
@@ -21,6 +21,14 @@ where
         Self {
             inner,
             buffer: BytesMut::with_capacity(1024),
+            item: PhantomData,
+        }
+    }
+
+    pub fn from(inner: OwnedReadHalf, buffer: BytesMut) -> Self {
+        Self {
+            inner,
+            buffer,
             item: PhantomData,
         }
     }
@@ -60,9 +68,6 @@ where
             }
             Err(ParseError::Incomplete) => Ok(None),
         }
-    }
-    pub fn take_inner(self) -> OwnedReadHalf {
-        self.inner
     }
 }
 
