@@ -89,9 +89,9 @@ impl Router {
         while let Some((task, peer)) = rx.recv().await {
             let f = async move {
                 if let Ok(mut conn) = task.await {
-                    let (tx, rx) = watch::channel(Vec::with_capacity(torrent.length() as usize));
+                    // let (tx, rx) = watch::channel(Vec::with_capacity(torrent.length() as usize));
 
-                    self.bitmap.inner.insert(peer.addr, tx);
+                    // self.bitmap.inner.insert(peer.addr, tx);
                     conn.handle(peer.clone()).await;
                 }
             };
