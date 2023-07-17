@@ -78,8 +78,8 @@ impl Table {
         }
     }
 
-    fn add(&mut self, node: Node, i: usize) {
-        let v = &self.inner[i];
+    fn add(&mut self, _node: Node, i: usize) {
+        let _v = &self.inner[i];
 
         todo!()
     }

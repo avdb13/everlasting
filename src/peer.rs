@@ -1,75 +1,47 @@
-use bendy::encoding::ToBencode;
 use bytes::{Buf, BytesMut};
 use futures_util::Future;
 use std::{
     collections::HashMap,
     fmt,
     fs::File,
-    io::{Cursor, ErrorKind, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    io::{Cursor, Write},
+    net::SocketAddr,
     sync::Arc,
     time::Duration,
 };
 use tokio::{
     net::{
         tcp::{OwnedReadHalf, OwnedWriteHalf},
-        TcpStream, UdpSocket,
+        TcpStream,
     },
     sync::{
-        mpsc::{self, channel, Receiver, Sender, UnboundedReceiver},
-        watch,
+        mpsc::{self, Receiver, Sender, UnboundedReceiver},
+        watch, RwLock,
     },
-    task::JoinSet,
 };
 
-use color_eyre::{owo_colors::OwoColorize, Report};
-use rand::Rng;
+use color_eyre::Report;
 
 use tokio::{
-    io::{self, split, AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     time::{sleep, timeout},
 };
-use tracing::{debug, error, field::debug, info};
+use tracing::debug;
 
 use crate::{
-    data::{GeneralError, Peer, Peers, TorrentInfo},
-    dht::Node,
-    extensions::ExtensionHeader,
+    bitmap::BitMap,
+    data::{Peer, Peers, TorrentInfo},
     framing::{FrameReader, ParseCheck, ParseError},
-    helpers::{self, decode, range_to_array},
-    krpc::{self, Arguments, ExtMessage, Method},
-    magnet::MagnetInfo,
-    udp::Response,
-    PEER_ID,
+    BLOCK_SIZE, PEER_ID,
 };
 
-pub type Bitfield = Vec<u8>;
-
-pub struct BitMap {
-    inner: HashMap<SocketAddr, watch::Receiver<Bitfield>>,
-}
-
-impl BitMap {
-    fn new() -> Self {
-        Self {
-            inner: HashMap::new(),
-        }
-    }
-
-    // fn rarest_pieces(&self) -> Vec<usize> {
-    //     let rx = self.inner.values();
-    //     rx.map(|&x| {
-
-    //     }).collect();
-    // }
-}
+pub type BitField = Vec<u8>;
 
 pub struct Router {
     pub torrent: TorrentInfo,
-    pub bitfield: Vec<u8>,
+    pub bitfield: Vec<u64>,
     pub peers: HashMap<SocketAddr, Connection>,
     pub peer_rx: Receiver<Peers>,
-    pub bitmap: BitMap,
 }
 
 impl Router {
@@ -77,21 +49,18 @@ impl Router {
         Router {
             torrent,
             peer_rx,
-            bitmap: BitMap::new(),
             peers: HashMap::new(),
             bitfield: Vec::new(),
         }
     }
 
     pub async fn run(self, torrent: TorrentInfo) {
+        let len = torrent.bitfield_size() as usize;
         let mut rx = Router::connect(self.peer_rx, torrent).await;
 
         while let Some((task, peer)) = rx.recv().await {
             let f = async move {
                 if let Ok(mut conn) = task.await {
-                    // let (tx, rx) = watch::channel(Vec::with_capacity(torrent.length() as usize));
-
-                    // self.bitmap.inner.insert(peer.addr, tx);
                     conn.handle(peer.clone()).await;
                 }
             };
@@ -147,7 +116,7 @@ pub struct Connection {
     pub writer: OwnedWriteHalf,
     pub buffer: BytesMut,
     pub rx: Receiver<Message>,
-    pub state: State,
+    pub state: Arc<RwLock<State>>,
     pub dht_port: Option<u16>,
 }
 
@@ -157,7 +126,7 @@ impl Connection {
             writer,
             rx,
             buffer: BytesMut::new(),
-            state: State::new(pieces),
+            state: Arc::new(RwLock::new(State::new())),
             dht_port: None,
         }
     }
@@ -195,52 +164,65 @@ impl Connection {
     }
 
     pub async fn handle(&mut self, peer: Peer) {
-        debug!("handling for [{}]", peer.addr);
+        let mut bitmap = BitMap::new();
 
         while let Some(message) = self.rx.recv().await {
             match message {
                 Message::Choke => {
-                    self.state.choked = true;
+                    let mut state = self.state.write().await;
+                    state.choked = true;
                 }
                 Message::Unchoke => {
-                    self.state.choked = false;
+                    let mut state = self.state.write().await;
+                    state.choked = false;
                 }
                 Message::Interested => {
-                    self.state.interested = true;
+                    let mut state = self.state.write().await;
+                    state.interested = true;
                 }
                 Message::Uninterested => {
-                    self.state.interested = false;
+                    let mut state = self.state.write().await;
+                    state.interested = false;
                 }
                 Message::Have(idx) => {
-                    let n = self.state.remote_bitfield[idx / 8] as usize;
-                    let missing = n | (idx % 8);
-                    debug!(missing = ?missing);
-                    let n = self.state.remote_bitfield.get_mut(idx / 8).unwrap();
-                    *n |= (idx % 8) as u8;
+                    let _ = bitmap.handle(peer.addr, Message::Have(idx)).await;
                 }
-                Message::Bitfield(v) => {
-                    self.state.remote_bitfield = v;
+                Message::BitField(v) => {
+                    let _ = bitmap.handle(peer.addr, Message::BitField(v)).await;
                 }
                 Message::Request {
-                    index,
-                    begin,
-                    length,
+                    index: _,
+                    begin: _,
+                    length: _,
                 } => todo!(),
                 Message::Piece {
-                    index,
-                    begin,
-                    block,
+                    index: _,
+                    begin: _,
+                    block: _,
                 } => todo!(),
                 Message::Cancel {
-                    index,
-                    begin,
-                    length,
+                    index: _,
+                    begin: _,
+                    length: _,
                 } => todo!(),
                 Message::Port(n) => self.dht_port = Some(n),
                 _ => todo!(),
             }
+
+            let state = self.state.read().await;
+            if !state.choked && state.interested {
+                let (_owner, idx) = bitmap.request_block();
+                let msg = Message::Request {
+                    index: idx,
+                    begin: 0,
+                    length: *BLOCK_SIZE,
+                };
+                self.writer.write_all(&msg.to_request()).await;
+            }
         }
     }
+
+    pub async fn download() {}
 }
 
 #[derive(Debug)]
@@ -249,18 +231,15 @@ pub struct State {
     pub interested: bool,
     pub peer_choked: bool,
     pub peer_interested: bool,
-    pub remote_bitfield: Vec<u8>,
 }
 
 impl State {
-    fn new(pieces: usize) -> Self {
-        let len = (pieces / 8) + 1;
+    fn new() -> Self {
         Self {
             choked: true,
             interested: false,
             peer_choked: true,
             peer_interested: false,
-            remote_bitfield: vec![0; len],
         }
     }
 }
@@ -378,7 +357,7 @@ pub enum Message {
     Interested,
     Uninterested,
     Have(usize),
-    Bitfield(Vec<u8>),
+    BitField(Vec<u64>),
     Request {
         index: usize,
         begin: usize,
@@ -407,7 +386,7 @@ impl fmt::Debug for Message {
             Self::Interested => write!(f, "Interested"),
             Self::Uninterested => write!(f, "Uninterested"),
             Self::Have(_) => f.debug_tuple("Have").finish(),
-            Self::Bitfield(_) => f.debug_tuple("Bitfield").finish(),
+            Self::BitField(_) => f.debug_tuple("BitField").finish(),
             Self::Request { .. } => f.debug_struct("Request").finish(),
             Self::Piece { .. } => f.debug_struct("Piece").finish(),
             Self::Cancel { .. } => f.debug_struct("Cancel").finish(),
@@ -428,12 +407,15 @@ impl Request for Message {
             Interested => [0, 0, 0, 1, 2].to_vec(),
             Uninterested => [0, 0, 0, 1, 3].to_vec(),
             Have(x) => [[0, 0, 0, 5, 4].as_slice(), &(*x as u32).to_be_bytes()].concat(),
-            Bitfield(v) => [
-                &(v.len() as u32 + 1).to_be_bytes(),
-                [5u8].as_slice(),
-                v.as_slice(),
-            ]
-            .concat(),
+            BitField(v) => {
+                let v: Vec<_> = v.iter().flat_map(|v| v.to_be_bytes()).collect();
+                [
+                    &(v.len() as u32 * 8 + 1).to_be_bytes(),
+                    [5u8].as_slice(),
+                    v.as_slice(),
+                ]
+                .concat()
+            }
             Request {
                 index,
                 begin,
@@ -510,8 +492,9 @@ impl ParseCheck for Message {
             return Err(ParseError::Incomplete);
         }
         let n = u32::from_be_bytes(n.try_into().unwrap()) as usize;
+        debug!(n);
 
-        let rem: Vec<_> = (0..n).map_while(|_| Self::get_u8(v)).collect();
+        let mut rem: Vec<_> = (0..n).map_while(|_| Self::get_u8(v)).collect();
         if rem.len() != n {
             return Err(ParseError::Incomplete);
         }
@@ -521,14 +504,19 @@ impl ParseCheck for Message {
             1 => Unchoke,
             2 => Interested,
             3 => Uninterested,
-            4 => Have(u32::from_be_bytes(rem[1..].try_into().unwrap()) as usize),
+            4 => Have(u32::from_be_bytes(rem[1..5].try_into().unwrap()) as usize),
             5 => {
-                let payload = rem[..rem.len()]
-                    .iter()
-                    .flat_map(|n| (0..8).map(|i| (n >> i) & 1).collect::<Vec<_>>())
+                let tail = (rem.len() - 1) % 8;
+                if tail != 0 {
+                    rem.append(&mut vec![0u8; 8 - tail]);
+                }
+
+                let payload = rem[1..rem.len()]
+                    .chunks(8)
+                    .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
                     .collect();
 
-                Bitfield(payload)
+                BitField(payload)
             }
             6 => {
                 let index = u32::from_be_bytes(rem[1..5].try_into().unwrap()) as usize;

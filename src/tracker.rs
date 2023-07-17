@@ -1,29 +1,27 @@
-use bendy::decoding::{Decoder as BendyDecoder, FromBencode};
+
 use color_eyre::Report;
-use dashmap::DashMap;
-use rand::Rng;
-use std::error::Error as StdError;
+
+
+
 use std::net::Ipv4Addr;
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
-use tokio::io::AsyncWrite;
+
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, watch};
 use tokio::{
-    net::{TcpStream, UdpSocket},
+    net::{UdpSocket},
     sync::mpsc::channel,
-    task::{JoinHandle, JoinSet},
+    task::{JoinSet},
     time::timeout,
 };
-use tracing::{debug, field::debug};
-use url::Url;
+use tracing::{debug};
 
-use crate::data::{Event, Peers};
+
+use crate::data::{Peers};
 use crate::tracker_session::{HttpSession, Parameters, UdpSession};
 use crate::{
-    data::{GeneralError, HttpResponse, ScrapeResponse, TorrentInfo, PROTOCOL_ID},
-    helpers::{self, decode, encode},
-    magnet::MagnetInfo,
-    udp::{Request, Response},
+    data::{TorrentInfo},
+    udp::{Response},
 };
 
 type ChannelMap = (
@@ -145,7 +143,7 @@ impl HttpTracker {
 
         let (peer_tx, peer_rx): (mpsc::Sender<Peers>, mpsc::Receiver<Peers>) = mpsc::channel(100);
 
-        let (param_tx, param_rx): (watch::Sender<Parameters>, watch::Receiver<Parameters>) =
+        let (_param_tx, param_rx): (watch::Sender<Parameters>, watch::Receiver<Parameters>) =
             watch::channel(Parameters::from(torrent));
 
         debug!("trackers: {:?}", trackers);

@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use thiserror::Error;
+use tracing::debug;
 
 use crate::udp::Response;
 
@@ -63,6 +64,12 @@ impl TorrentInfo {
             Mode::Single { length, .. } => length.to_owned(),
             Mode::Multi { files, .. } => files.iter().map(|f| f.length).sum(),
         }
+    }
+
+    pub fn bitfield_size(&self) -> u64 {
+        let len = self.length();
+        let piece_len = self.info.piece_length;
+        len / piece_len / 64 + 1
     }
 }
 

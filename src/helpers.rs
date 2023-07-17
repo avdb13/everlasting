@@ -1,14 +1,12 @@
 use color_eyre::Report;
-use futures_util::{future::BoxFuture, Future};
+use futures_util::{Future};
 use std::{
-    borrow::Cow,
-    net::{SocketAddr, ToSocketAddrs},
     thread::sleep,
     time::Duration,
 };
-use url::Url;
 
-use crate::data::{self, GeneralError};
+
+use crate::data::{GeneralError};
 
 pub fn prettier(s: String) -> String {
     s.chars()

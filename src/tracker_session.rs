@@ -1,9 +1,9 @@
-use async_trait::async_trait;
+
 use bendy::decoding::FromBencode;
 use color_eyre::Report;
-use dashmap::DashMap;
+
 use futures_util::{FutureExt, TryFutureExt};
-use rand::{seq::SliceRandom, Rng};
+use rand::{Rng};
 use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     net::UdpSocket,
@@ -18,7 +18,7 @@ use tracing::debug;
 use url::Url;
 
 use crate::{
-    data::{Event, GeneralError, HttpResponse, Peer, Peers, TorrentInfo, PROTOCOL_ID},
+    data::{Event, GeneralError, HttpResponse, Peers, TorrentInfo, PROTOCOL_ID},
     helpers,
     udp::{Request, Response},
     BITTORRENT_PORT, PEER_ID,

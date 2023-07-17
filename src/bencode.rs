@@ -1,20 +1,14 @@
-use std::{
-    collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs},
-};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 
 use hex::FromHex;
 
 use bendy::{
     decoding::{Decoder, Error as DecodingError, FromBencode, Object},
-    encoding::{
-        AsString, Encoder, Error as EncodingError, SingleItemEncoder, ToBencode,
-        UnsortedDictEncoder,
-    },
+    encoding::AsString,
 };
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
-use tracing::debug;
+
 use url::Url;
 
 use crate::{
@@ -412,7 +406,7 @@ impl FromBencode for ScrapeResponse {
                             status.leechers = u32::decode_bencode_object(pair.1)?;
                         }
                         (b"downloaded", _) => {
-                            let err = u32::decode_bencode_object(pair.1)?;
+                            let _err = u32::decode_bencode_object(pair.1)?;
                         }
                         _ => {}
                     }

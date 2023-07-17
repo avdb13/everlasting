@@ -1,35 +1,23 @@
-use crate::magnet::MagnetInfo;
-use crate::tracker::UdpTracker;
 use bendy::decoding::FromBencode;
-use data::{File, GeneralError, TorrentInfo};
-use dht::bootstrap_dht;
+use data::TorrentInfo;
+
 use lazy_static::lazy_static;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
-use std::sync::Arc;
+
 use tracker::HttpTracker;
-use url::Url;
 
 use crate::peer::Router;
 
 use color_eyre::Report;
 
-use udp::Response;
+use std::io::Read;
 
-use std::collections::HashMap;
-use std::fs::read_to_string;
-use std::io::{stdin, BufRead, BufReader, ErrorKind, Read, Write};
-use std::net::SocketAddr;
-
-use std::path::Path;
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-
-use tracing::debug;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub mod app;
 pub mod bencode;
+pub mod bitmap;
 pub mod data;
 pub mod dht;
 pub mod extensions;
@@ -49,6 +37,7 @@ pub mod udp;
 pub mod writer;
 
 lazy_static! {
+    static ref BLOCK_SIZE: usize = 2 ^ 14;
     static ref BITTORRENT_PORT: u16 = 1317;
     static ref PEER_ID_PREFIX: &'static str = "XV";
     static ref SUFFIX: Vec<char> = rand::thread_rng()

@@ -132,11 +132,11 @@ impl Request {
                 info_hash,
                 peer_id,
                 up_down_left,
-                event,
-                socket,
+                event: _,
+                socket: _,
                 key,
                 num_want,
-                extensions,
+                extensions: _,
             } => {
                 [
                     cid.to_be_bytes().to_vec(),

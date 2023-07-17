@@ -9,6 +9,7 @@ edition = "2021"
 anyhow = { version = "1.0.66", features = ["backtrace"] }
 async-trait = "0.1.68"
 bendy = { version = "0.3.3", path = "../bendy" }
+bitvec = "1.0.1"
 byte-unit = "4.0.19"
 bytes = "1.4.0"
 chrono = "0.4.24"

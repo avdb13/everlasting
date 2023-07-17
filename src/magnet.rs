@@ -1,7 +1,7 @@
 use std::net::{SocketAddr, ToSocketAddrs};
 
 use color_eyre::Report;
-use rand::Rng;
+
 use url::Url;
 
 use crate::{data::GeneralError, helpers::decode};
