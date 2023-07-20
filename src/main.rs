@@ -5,19 +5,18 @@ use lazy_static::lazy_static;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 
+use tokio::fs::create_dir;
+use tracing::debug;
 use tracker::HttpTracker;
 
 use crate::peer::Router;
 
 use color_eyre::Report;
 
-use std::io::Read;
-
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub mod app;
 pub mod bencode;
-pub mod bitmap;
 pub mod data;
 pub mod dht;
 pub mod extensions;
@@ -27,6 +26,8 @@ pub mod krpc;
 pub mod magnet;
 pub mod nameless;
 pub mod peer;
+pub mod piece_map;
+pub mod pwp;
 pub mod scrape;
 pub mod socket;
 pub mod state;
@@ -68,21 +69,16 @@ async fn main() -> Result<(), Report> {
         .with(console_subscriber::spawn())
         .init();
 
-    // let mut input = String::new();
-    // stdin().read_line(&mut input)?;
-
-    // if !Path::new(&input).exists() {
-    //     return Err(GeneralError::NonExistentFile.into());
-    // }
-
     let torrent = std::fs::read("/home/mikoto/everlasting/test.torrent")?;
     let torrent_info = TorrentInfo::from_bencode(&torrent).unwrap();
+
+    create_dir("./pieces").await?;
 
     let (tracker, peer_rx) = HttpTracker::new(&torrent_info);
     tokio::spawn(tracker.run(torrent_info.clone()));
 
     let router = Router::new(torrent_info.clone(), peer_rx);
-    router.run(torrent_info).await;
+    router.run().await;
 
     loop {}
 

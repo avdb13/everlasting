@@ -77,7 +77,7 @@ impl TorrentInfo {
 pub struct Info {
     pub mode: Mode,
     pub piece_length: u64,
-    pub pieces: Vec<[u8; SHA1_LEN]>,
+    pub pieces: Box<[[u8; SHA1_LEN]]>,
     pub private: Option<()>,
     pub value: [u8; 20],
 }
@@ -113,7 +113,7 @@ pub struct File {
     pub path: Vec<String>,
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, Hash, Eq, PartialEq, Clone)]
 pub struct Peer {
     pub id: Option<[u8; 20]>,
     pub addr: SocketAddr,

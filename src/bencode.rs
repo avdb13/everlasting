@@ -107,11 +107,12 @@ impl FromBencode for TorrentInfo {
                 }
                 (b"pieces", _) => {
                     let pieces = pair.1.try_into_bytes()?;
-                    let pieces: Vec<_> = pieces
+                    let pieces: Vec<[u8; SHA1_LEN]> = pieces
                         .chunks(pieces.len() / SHA1_LEN)
-                        .map(|x| range_to_array(&x[0..=20]))
+                        .map(|x| x[0..=20].try_into().unwrap())
                         .collect();
-                    md.info.pieces = pieces;
+
+                    md.info.pieces = pieces.into_boxed_slice();
                 }
                 (b"nodes", _) => {
                     let mut list = pair.1.try_into_list()?;
@@ -168,22 +169,19 @@ impl FromBencode for Info {
                 md5sum,
             } => {
                 while let Some(pair) = dict.next_pair()? {
-                    dbg!(&std::str::from_utf8(pair.0).unwrap());
                     match pair {
                         (b"piece length", _) => {
                             let i = u64::decode_bencode_object(pair.1)?;
-                            dbg!("piece length: {}", i);
                             info.piece_length = i;
                         }
                         (b"pieces", _) => {
                             let pieces = pair.1.try_into_bytes()?;
-                            dbg!(&pieces.len());
-                            let pieces: Vec<_> = pieces
+                            let pieces: Vec<[u8; SHA1_LEN]> = pieces
                                 .chunks(pieces.len() / SHA1_LEN)
-                                .map(|x| range_to_array(&x[0..=20]))
+                                .map(|x| x[0..=20].try_into().unwrap())
                                 .collect();
-                            dbg!(&pieces, &pieces.len());
-                            info.pieces = pieces;
+
+                            info.pieces = pieces.into_boxed_slice();
                         }
                         (b"private", _) => {
                             info.private = Some(());
@@ -242,7 +240,6 @@ impl FromBencode for Info {
                     match pair {
                         (b"piece length", _) => {
                             let len = u64::decode_bencode_object(pair.1)?;
-                            dbg!(&len);
                             info.piece_length = len;
                         }
                         (b"pieces", _) => {
@@ -251,8 +248,8 @@ impl FromBencode for Info {
                                 .chunks(SHA1_LEN)
                                 .map(|x| range_to_array(&x[0..20]))
                                 .collect();
-                            dbg!(&pieces.len());
-                            info.pieces = pieces;
+
+                            info.pieces = pieces.into_boxed_slice();
                         }
                         (b"private", _) => {
                             info.private = Some(());
