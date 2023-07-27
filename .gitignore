@@ -1,6 +1,3 @@
 target/
+downloads/
 *.torrent
-to-delete.txt
-/magnet
-peers
-bitfields

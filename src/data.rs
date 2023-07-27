@@ -71,7 +71,22 @@ impl TorrentInfo {
         let piece_len = self.info.piece_length;
         len / piece_len / 64 + 1
     }
+
+    pub fn file_layout(&self) -> Layout {
+        match &self.info.mode {
+            Mode::Single { name, .. } => (name, None),
+            Mode::Multi {
+                dir_name, files, ..
+            } => {
+                let files = files.iter().map(|f| f.path.as_slice()).collect();
+                (dir_name, Some(files))
+            }
+        }
+    }
 }
+
+// first value is either multi-mode directory or single mode file
+pub type Layout<'a> = (&'a str, Option<Vec<&'a [String]>>);
 
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Info {

@@ -1,12 +1,27 @@
 use color_eyre::Report;
-use futures_util::{Future};
+use futures_util::Future;
 use std::{
     thread::sleep,
-    time::Duration,
+    time::{self, Duration},
 };
 
+use crate::data::GeneralError;
 
-use crate::data::{GeneralError};
+pub struct Timer(time::Instant, time::Duration);
+
+impl Timer {
+    pub fn new(duration: time::Duration) -> Self {
+        Self(time::Instant::now(), duration)
+    }
+
+    pub fn reset(&mut self) {
+        self.0 = time::Instant::now();
+    }
+
+    pub fn elapsed(&self) -> bool {
+        self.0.elapsed() >= self.1
+    }
+}
 
 pub fn prettier(s: String) -> String {
     s.chars()

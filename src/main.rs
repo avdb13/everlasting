@@ -1,3 +1,6 @@
+#![feature(vec_push_within_capacity)]
+#![feature(slice_take)]
+
 use bendy::decoding::FromBencode;
 use data::TorrentInfo;
 
@@ -5,11 +8,10 @@ use lazy_static::lazy_static;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 
-use tokio::fs::create_dir;
 use tracing::debug;
 use tracker::HttpTracker;
 
-use crate::peer::Router;
+use crate::{fs::create_layout, peer::Router};
 
 use color_eyre::Report;
 
@@ -21,12 +23,13 @@ pub mod data;
 pub mod dht;
 pub mod extensions;
 pub mod framing;
+pub mod fs;
 pub mod helpers;
 pub mod krpc;
 pub mod magnet;
 pub mod nameless;
 pub mod peer;
-pub mod piece_map;
+pub mod piece_manager;
 pub mod pwp;
 pub mod scrape;
 pub mod socket;
@@ -35,7 +38,7 @@ pub mod torrent;
 pub mod tracker;
 pub mod tracker_session;
 pub mod udp;
-pub mod writer;
+// pub mod writer;
 
 lazy_static! {
     static ref BLOCK_SIZE: usize = 2 ^ 14;
@@ -69,10 +72,12 @@ async fn main() -> Result<(), Report> {
         .with(console_subscriber::spawn())
         .init();
 
-    let torrent = std::fs::read("/home/mikoto/everlasting/test.torrent")?;
+    let torrent = std::fs::read("/home/mikoto/everlasting/music.torrent")?;
     let torrent_info = TorrentInfo::from_bencode(&torrent).unwrap();
 
-    create_dir("./pieces").await?;
+    let ok = torrent_info.file_layout();
+    create_layout(ok)?;
+    panic!();
 
     let (tracker, peer_rx) = HttpTracker::new(&torrent_info);
     tokio::spawn(tracker.run(torrent_info.clone()));

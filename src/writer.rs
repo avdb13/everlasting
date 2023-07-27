@@ -1,11 +1,15 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     data::Peer,
     piece_map::PieceMap,
     pwp::{Message, Request},
 };
-use tokio::{io::AsyncWriteExt, net::tcp::OwnedWriteHalf, sync::mpsc::Receiver};
+use tokio::{
+    io::AsyncWriteExt,
+    net::tcp::OwnedWriteHalf,
+    sync::{mpsc::Receiver, RwLock},
+};
 use tracing::debug;
 
 pub struct Buffer {
@@ -15,7 +19,7 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    fn new(piece_len: usize, pieces: usize) -> Self {
+    pub fn new(piece_len: usize, pieces: usize) -> Self {
         let buffer = vec![vec![0u8; piece_len].into_boxed_slice(); pieces];
         Self {
             inner: buffer.into_boxed_slice(),
@@ -37,33 +41,39 @@ impl Buffer {
 }
 
 pub struct Writer {
-    writer_rx: Receiver<(Peer, OwnedWriteHalf)>,
-    req_rx: Receiver<(Message, Peer)>,
-    buffer: Buffer,
-    map: PieceMap,
+    pub lock: Arc<RwLock<HashMap<Peer, OwnedWriteHalf>>>,
+    pub req_rx: Receiver<(Message, Peer)>,
+    pub buffer: Buffer,
 }
 
 impl Writer {
-    pub fn new(
-        writer_rx: Receiver<(Peer, OwnedWriteHalf)>,
-        req_rx: Receiver<(Message, Peer)>,
-        buffer: Buffer,
-        map: PieceMap,
-    ) -> Self {
+    pub fn new(req_rx: Receiver<(Message, Peer)>, buffer: Buffer, map: PieceMap) -> Self {
         Self {
-            writer_rx,
+            lock: Arc::new(RwLock::new(HashMap::new())),
             req_rx,
             buffer,
-            map,
         }
     }
 
-    pub async fn listen(&mut self) {}
+    pub async fn listen(
+        lock: Arc<RwLock<HashMap<Peer, OwnedWriteHalf>>>,
+        mut writer_rx: Receiver<(Peer, OwnedWriteHalf)>,
+    ) {
+        while let Some((peer, w)) = writer_rx.recv().await {
+            let mut lock = lock.write().await;
 
-    pub async fn resolve(&mut self) {
+            if let Some(_) = lock.insert(peer, w) {
+                panic!();
+            }
+        }
+    }
+
+    pub async fn request_piece(&mut self) {
+        let mut lock = self.lock.write().await;
+
         let v = self.map.request_piece().await;
         for (peer, msg) in v {
-            let w = self.w.get_mut(&peer).unwrap();
+            let w = lock.get_mut(&peer).unwrap();
             let _ = w.write_all(&msg.to_request()).await;
 
             debug!("requested piece");
@@ -71,7 +81,7 @@ impl Writer {
     }
 
     pub async fn download(&mut self) {
-        while let Some((msg, peer)) = self.rx.recv().await {
+        while let Some((msg, _)) = self.req_rx.recv().await {
             match msg {
                 Message::Piece {
                     index,

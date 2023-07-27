@@ -11,6 +11,7 @@ pub struct State {
     pub interested: bool,
     pub peer_choked: bool,
     pub peer_interested: bool,
+    pub dht_port: Option<u16>,
 }
 
 impl State {
@@ -20,6 +21,7 @@ impl State {
             interested: false,
             peer_choked: true,
             peer_interested: false,
+            dht_port: None,
         }
     }
 }
@@ -137,7 +139,7 @@ pub enum Message {
     Interested,
     Uninterested,
     Have(usize),
-    BitField(Vec<u64>),
+    BitField(Vec<usize>),
     Request {
         index: usize,
         begin: usize,
@@ -291,8 +293,8 @@ impl ParseCheck for Message {
                 }
 
                 let payload = rem[1..rem.len()]
-                    .chunks(8)
-                    .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+                    .chunks(std::mem::size_of::<usize>() / 8)
+                    .map(|c| usize::from_be_bytes(c.try_into().unwrap()))
                     .collect();
 
                 BitField(payload)

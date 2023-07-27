@@ -176,9 +176,11 @@ impl FromBencode for Info {
                         }
                         (b"pieces", _) => {
                             let pieces = pair.1.try_into_bytes()?;
+                            assert_eq!(pieces.len() % 20, 0);
+
                             let pieces: Vec<[u8; SHA1_LEN]> = pieces
                                 .chunks(pieces.len() / SHA1_LEN)
-                                .map(|x| x[0..=20].try_into().unwrap())
+                                .map(|x| x[0..20].try_into().unwrap())
                                 .collect();
 
                             info.pieces = pieces.into_boxed_slice();

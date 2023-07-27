@@ -36,9 +36,6 @@ url = "2.3.1"
 urlencoding = "2.1.2"
 
 [[bin]]
-name = "client"
-path = "src/bin/client.rs"
+name = "test"
+path = "src/test/main.rs"
 
-[[bin]]
-name = "daemon"
-path = "src/bin/daemon.rs"

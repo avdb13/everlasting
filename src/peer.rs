@@ -1,4 +1,5 @@
 use bytes::{Buf, BytesMut};
+use chrono::Utc;
 use futures_util::Future;
 use std::{
     collections::HashMap,
@@ -32,13 +33,11 @@ use tracing::debug;
 use crate::{
     data::{Peer, Peers, TorrentInfo},
     framing::FrameReader,
-    piece_map::PieceMap,
-    writer::Writer,
+    helpers::Timer,
+    piece_manager::{BitField, PieceManager},
 };
 
 use crate::pwp::*;
-
-pub type BitField = Vec<u8>;
 
 pub struct Router {
     pub torrent: Arc<TorrentInfo>,
@@ -58,28 +57,25 @@ impl Router {
     }
 
     pub async fn run(mut self) {
-        let len = self.torrent.info.pieces.len();
+        let pieces = self.torrent.info.pieces.len();
+        let piece_len = self.torrent.info.piece_length as usize;
+
         let handshake = Arc::new(Handshake::new(self.torrent.info.value));
-
-        let (piece_tx, piece_rx) = mpsc::channel(100);
         let (bitfield_tx, bitfield_rx) = mpsc::channel(100);
-        let (writer_tx, writer_rx) = mpsc::channel(100);
 
-        let piece_map = PieceMap::new(len);
-        let writer = Writer::new();
-
-        tokio::spawn(async move { piece_map.listen(piece_rx).await });
+        let manager = PieceManager::new(piece_len, pieces);
+        manager.listen(bitfield_rx);
+        // let buffer = Buffer::new(pieces, piece_len);
+        // let writer = Writer::new(piece_rx, buffer, piece_map);
 
         while let Some(peers) = self.peer_rx.recv().await {
             for peer in peers.into_iter() {
                 let handshake = handshake.clone();
-                let piece_tx = piece_tx.clone();
-                let writer_tx = writer_tx.clone();
+                let bitfield_tx = bitfield_tx.clone();
 
                 tokio::spawn(async move {
-                    if let Ok((conn, w)) = Connection::handshake(peer, handshake).await {
-                        let _ = writer_tx.send((peer, w)).await;
-                        conn.handle(piece_tx, bitfield_tx).await;
+                    if let Ok(conn) = Connection::handshake(peer, handshake, pieces).await {
+                        conn.handle(bitfield_tx).await;
                     }
                 });
             }
@@ -89,25 +85,20 @@ impl Router {
 
 #[derive(Debug)]
 pub struct Connection {
-    pub inner: Peer,
+    pub inner: OwnedWriteHalf,
     pub buffer: BytesMut,
     pub state: Arc<RwLock<State>>,
-    pub dht_port: Option<u16>,
     pub frame_rx: Receiver<Message>,
+    pub real_len: usize,
     // pub piece_tx: Sender<Message>,
 }
 
 impl Connection {
-    pub fn new(
-        inner: Peer,
-        frame_rx: Receiver<Message>,
-        // piece_tx: Sender<Message>,
-        // pieces: usize,
-    ) -> Self {
+    pub fn new(inner: OwnedWriteHalf, frame_rx: Receiver<Message>, real_len: usize) -> Self {
         Self {
             inner,
             frame_rx,
-            dht_port: None,
+            real_len,
             buffer: BytesMut::new(),
             state: Arc::new(RwLock::new(State::new())),
         }
@@ -117,8 +108,8 @@ impl Connection {
         peer: Peer,
         handshake: Arc<Handshake>,
         // piece_tx: Sender<Message>,
-        // pieces: usize,
-    ) -> Result<(Connection, OwnedWriteHalf), Report> {
+        pieces: usize,
+    ) -> Result<Connection, Report> {
         let stream = timeout(Duration::from_secs(3), TcpStream::connect(peer.addr)).await??;
         let (r, mut w) = stream.into_split();
 
@@ -129,7 +120,7 @@ impl Connection {
         w.write_all(&handshake.to_request()).await?;
         debug!("handshake was sent to [{}] ...", peer.addr);
 
-        Ok((Connection::new(peer, frame_rx), w))
+        Ok(Connection::new(w, frame_rx, pieces))
     }
 
     pub async fn keep_alive(mut w: OwnedWriteHalf) {
@@ -155,18 +146,31 @@ impl Connection {
         let mut reader: FrameReader<Message> = FrameReader::from(reader.inner, reader.buffer);
         while let Some(frame) = reader.read_frame().await? {
             debug!("received frame from [{}]: {:?}", peer_addr, frame);
+
             tx.send(frame).await?;
         }
 
         Ok(())
     }
 
-    pub async fn handle(
-        mut self,
-        bitfield_tx: Sender<(Message, Peer)>,
-        piece_tx: Sender<(Message, Peer)>,
-    ) {
+    pub async fn handle(mut self, bitfield_tx: Sender<(SocketAddr, BitField)>) {
+        let dst = self.inner.peer_addr().unwrap();
+        let mut have_buffer: Vec<usize> = Vec::with_capacity(64);
+        let mut timer = Timer::new(Duration::from_secs(3));
+
         while let Some(message) = self.frame_rx.recv().await {
+            // cache have messages
+            if let Message::Have(idx) = message {
+                timer.reset();
+                have_buffer.push(idx);
+            }
+
+            if timer.elapsed() {
+                let bitfield = BitField::from_lazy(have_buffer.clone(), self.real_len);
+                let _ = bitfield_tx.send((dst, bitfield)).await;
+            }
+
+            // simple state changes
             let mut state = self.state.write().await;
             match message {
                 Message::Choke => {
@@ -181,43 +185,12 @@ impl Connection {
                 Message::Uninterested => {
                     state.interested = false;
                 }
+                Message::Port(i) => {
+                    state.dht_port = Some(i);
+                }
                 _ => {}
             }
             drop(state);
-
-            match message {
-                Message::Have(idx) => {
-                    let _ = bitfield_tx
-                        .send((Message::Have(idx), self.inner.clone()))
-                        .await;
-                }
-                Message::BitField(v) => {
-                    let _ = bitfield_tx
-                        .send((Message::BitField(v), self.inner.clone()))
-                        .await;
-                }
-                Message::Request {
-                    index: _,
-                    begin: _,
-                    length: _,
-                } => todo!(),
-                Message::Piece {
-                    index: i,
-                    begin: j,
-                    block: v,
-                } => {
-                    let _ = piece_tx
-                        .send((Message::Have(idx), self.inner.clone()))
-                        .await;
-                }
-                Message::Cancel {
-                    index: _,
-                    begin: _,
-                    length: _,
-                } => todo!(),
-                Message::Port(n) => self.dht_port = Some(n),
-                _ => {}
-            }
         }
     }
 }
