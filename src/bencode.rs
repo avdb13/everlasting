@@ -9,6 +9,7 @@ use bendy::{
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 
+use tracing::debug;
 use url::Url;
 
 use crate::{
@@ -195,12 +196,11 @@ impl FromBencode for Info {
                         (b"files", list) => {
                             let mut list = list.try_into_list()?;
 
-                            while let Some(file) = list.next_object()? {
-                                let mut file = file.try_into_dictionary()?;
+                            while let Some(dict) = list.next_object()? {
+                                let mut dict = dict.try_into_dictionary()?;
+                                let mut file = File::default();
 
-                                while let Some(pair) = file.next_pair()? {
-                                    let mut file = File::default();
-
+                                while let Some(pair) = dict.next_pair()? {
                                     match pair {
                                         (b"length", _) => {
                                             file.length = u64::decode_bencode_object(pair.1)?;
@@ -211,16 +211,17 @@ impl FromBencode for Info {
                                         }
                                         (b"path", _) => {
                                             let mut path = pair.1.try_into_list()?;
-                                            while let Some(x) = path.next_object()? {
-                                                let s = String::decode_bencode_object(x)?;
+                                            while let Some(s) = path.next_object()? {
+                                                let s = String::decode_bencode_object(s)?;
                                                 file.path.push(s);
                                             }
                                         }
                                         _ => {}
                                     }
-
-                                    files.push(file);
                                 }
+
+                                debug!(?file);
+                                files.push(file);
                             }
                         }
                         _ => {}

@@ -61,6 +61,7 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
+    dbg!("program started");
     color_eyre::install()?;
 
     tracing_subscriber::registry()
@@ -71,12 +72,14 @@ async fn main() -> Result<(), Report> {
         .with(tracing_subscriber::fmt::layer())
         .with(console_subscriber::spawn())
         .init();
+    dbg!("tracing_subscriber and color_eyre done setting up");
 
     let torrent = std::fs::read("/home/mikoto/everlasting/music.torrent")?;
     let torrent_info = TorrentInfo::from_bencode(&torrent).unwrap();
 
     let ok = torrent_info.file_layout();
     create_layout(ok)?;
+
     panic!();
 
     let (tracker, peer_rx) = HttpTracker::new(&torrent_info);

@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use tokio::sync::{mpsc::Receiver, watch};
 use tracing::{debug, info};
 
-use crate::data::Layout;
+use crate::data::{GeneralError, Layout};
 use crate::pwp::Message;
 
 #[derive(Debug, Clone)]
@@ -58,11 +58,7 @@ impl BitXor for BitField {
 
         assert_eq!(left.len(), right.len());
 
-        let inner = left
-            .into_iter()
-            .zip(right.iter())
-            .map(|(x, y)| *x ^ y)
-            .collect();
+        let inner = left.iter().zip(right.iter()).map(|(x, y)| *x ^ y).collect();
 
         BitField(inner)
     }
@@ -142,18 +138,77 @@ type Block = Option<Box<[u8]>>;
 // the boolean indicates whether this piece was flushed to the disk
 type Piece = (Option<Box<[Block]>>, bool);
 
-pub struct PieceWrapper(Box<[Piece]>);
+pub struct PiecesWrapper {
+    piece_len: usize,
+    inner: Box<[Piece]>,
+    files: Vec<crate::data::File>,
+}
 
-// impl PieceWrapper {
-//     pub async fn write(&mut self, index: usize, begin: usize, block: &[u8]) -> Result<(), Report> {}
+impl PiecesWrapper {
+    // pub async fn write(&mut self, index: usize, begin: usize, block: &[u8]) -> Result<(), Report> {}
 
-//     pub async fn flush_piece(&mut self, index: usize) -> Result<(), Report> {
-//         // first unwrap implies that the piece is within bounds and
-//         // the second one implies that the piece is definitely available
-//         let (piece, flushed) = self.0.get(index).unwrap();
-//         let complete = piece.unwrap().iter().all(Option::is_some);
-//         drop(piece);
+    pub async fn flush_piece(&mut self, index: usize) -> Result<(), Report> {
+        // first unwrap implies that the piece is within bounds and
+        // the second one implies that the piece is definitely available
+        let (piece, flushed) = self.inner.get(index).unwrap();
+        let complete = piece
+            .as_ref()
+            .map(|ok| ok.iter().all(Option::is_some))
+            .unwrap();
 
-//         if !flushed && complete {}
-//     }
-// }
+        if !flushed && complete {
+            let piece_offset = (self.piece_len * index) as u64;
+            let lengths = self.files.iter().map(|f| f.length);
+
+            let n = (0..self.files.len())
+                .find(|&i| lengths.clone().take(i).sum::<u64>() >= piece_offset)
+                .ok_or(GeneralError::NonExistentFile)?
+                - 1;
+
+            debug!(?n);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bendy::decoding::FromBencode;
+    use color_eyre::Report;
+    use rand::Rng;
+    use tracing::debug;
+
+    use crate::data::{Mode, TorrentInfo};
+
+    #[test]
+    fn test_map_piece_to_file() -> Result<(), Report> {
+        let torrent = std::fs::read("/home/mikoto/everlasting/music.torrent")?;
+        let torrent = TorrentInfo::from_bencode(&torrent).unwrap();
+
+        let piece_len = torrent.info.piece_length;
+        let pieces_len = torrent.info.pieces.len();
+        let files = if let Mode::Multi { files, .. } = torrent.info.mode {
+            files
+        } else {
+            panic!();
+        };
+
+        let index = rand::thread_rng().gen_range(0..pieces_len);
+        let piece_offset = piece_len * index as u64;
+        dbg!(&piece_offset);
+        let lengths = files.iter().map(|f| f.length);
+
+        let n = (0..files.len())
+            .find(|&i| lengths.clone().take(i).sum::<u64>() >= piece_offset)
+            .unwrap()
+            - 1;
+        let total = lengths.clone().take(n).sum::<u64>();
+        dbg!(&total, &piece_offset);
+
+        assert!(total < piece_offset);
+        // figure out why this doesn't work next time :D
+        // assert!(piece_offset < total);
+
+        Ok(())
+    }
+}

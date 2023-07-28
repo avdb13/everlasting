@@ -1,6 +1,7 @@
 use std::{
     fs::{create_dir, create_dir_all, File},
     path::Path,
+    slice,
 };
 
 use ahash::{HashSet, HashSetExt};
@@ -18,8 +19,6 @@ pub fn create_layout(layout: Layout) -> Result<(), Report> {
         let files = files.into_iter().filter(|x| !x.is_empty());
 
         for file in files {
-            debug!(?file);
-
             if file.len() == 1 {
                 File::create(full_path.join(file[0].clone()))?;
             } else {
@@ -41,9 +40,3 @@ pub fn create_layout(layout: Layout) -> Result<(), Report> {
 
     Ok(())
 }
-
-// transform linked list to non-binary tree for files
-// pub enum Node<'a> {
-//     Leaf(&'a str),
-//     Branch(HashSet<Node<'a>>),
-// }
