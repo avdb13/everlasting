@@ -1,28 +1,16 @@
-
 use color_eyre::Report;
-
-
 
 use std::net::Ipv4Addr;
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, watch};
-use tokio::{
-    net::{UdpSocket},
-    sync::mpsc::channel,
-    task::{JoinSet},
-    time::timeout,
-};
-use tracing::{debug};
+use tokio::{net::UdpSocket, sync::mpsc::channel, task::JoinSet, time::timeout};
+use tracing::debug;
 
-
-use crate::data::{Peers};
+use crate::data::Peers;
 use crate::tracker_session::{HttpSession, Parameters, UdpSession};
-use crate::{
-    data::{TorrentInfo},
-    udp::{Response},
-};
+use crate::{data::TorrentInfo, udp::Response};
 
 type ChannelMap = (
     HashMap<SocketAddr, mpsc::Sender<Response>>,
@@ -35,7 +23,7 @@ pub struct UdpTracker {
 }
 
 impl UdpTracker {
-    pub async fn new(torrent: &TorrentInfo) -> Result<(Self, Receiver<Peers>), Report> {
+    pub async fn new(torrent: Arc<TorrentInfo>) -> Result<(Self, Receiver<Peers>), Report> {
         let trackers = torrent.announce.udp.clone();
         let (peer_tx, peer_rx) = channel(100);
 
@@ -73,12 +61,12 @@ impl UdpTracker {
         ))
     }
 
-    pub async fn run(self, torrent: TorrentInfo) -> Result<(), Report> {
+    pub async fn run(self, torrent: Arc<TorrentInfo>) -> Result<(), Report> {
         let mut set = JoinSet::new();
 
         for (_, session) in self.session_map.into_iter() {
             let torrent = torrent.clone();
-            set.spawn(async move { session.run(&torrent).await });
+            set.spawn(async move { session.run(torrent).await });
         }
 
         tokio::spawn(async move {
@@ -138,13 +126,13 @@ impl Parameters {
 // pub type WatchMap = HashMap<String, (watch::Sender<Parameters>, watch::Receiver<Parameters>)>;
 
 impl HttpTracker {
-    pub fn new(torrent: &TorrentInfo) -> (Self, mpsc::Receiver<Peers>) {
+    pub fn new(torrent: Arc<TorrentInfo>) -> (Self, mpsc::Receiver<Peers>) {
         let trackers = &torrent.announce;
 
         let (peer_tx, peer_rx): (mpsc::Sender<Peers>, mpsc::Receiver<Peers>) = mpsc::channel(100);
 
         let (_param_tx, param_rx): (watch::Sender<Parameters>, watch::Receiver<Parameters>) =
-            watch::channel(Parameters::from(torrent));
+            watch::channel(Parameters::from(torrent.clone()));
 
         debug!("trackers: {:?}", trackers);
         let trackers: Vec<HttpSession> = trackers
@@ -156,11 +144,14 @@ impl HttpTracker {
         (Self { trackers }, peer_rx)
     }
 
-    pub async fn run(self, torrent: TorrentInfo) -> Result<(), Report> {
+    pub async fn run(self, torrent: Arc<TorrentInfo>) -> Result<(), Report> {
         let mut set = JoinSet::new();
 
         for session in self.trackers {
-            set.spawn(session.run(torrent.clone()));
+            set.spawn({
+                let torrent = torrent.clone();
+                session.run(torrent)
+            });
         }
 
         while let Some(resp) = set.join_next().await {

@@ -1,6 +1,8 @@
 #![feature(vec_push_within_capacity)]
 #![feature(slice_take)]
 
+use std::sync::Arc;
+
 use bendy::decoding::FromBencode;
 use data::TorrentInfo;
 
@@ -8,10 +10,9 @@ use lazy_static::lazy_static;
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 
-use tracing::debug;
 use tracker::HttpTracker;
 
-use crate::{fs::create_layout, peer::Router};
+use crate::peer::Router;
 
 use color_eyre::Report;
 
@@ -75,14 +76,11 @@ async fn main() -> Result<(), Report> {
     dbg!("tracing_subscriber and color_eyre done setting up");
 
     let torrent = std::fs::read("/home/mikoto/everlasting/music.torrent")?;
-    let torrent_info = TorrentInfo::from_bencode(&torrent).unwrap();
-
-    let ok = torrent_info.file_layout();
-    create_layout(ok)?;
+    let torrent_info = Arc::new(TorrentInfo::from_bencode(&torrent).unwrap());
 
     panic!();
 
-    let (tracker, peer_rx) = HttpTracker::new(&torrent_info);
+    let (tracker, peer_rx) = HttpTracker::new(torrent_info);
     tokio::spawn(tracker.run(torrent_info.clone()));
 
     let router = Router::new(torrent_info.clone(), peer_rx);

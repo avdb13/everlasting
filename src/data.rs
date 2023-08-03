@@ -1,5 +1,10 @@
-use std::net::SocketAddr;
+use std::{
+    fs,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
+use color_eyre::Report;
 use thiserror::Error;
 use tracing::debug;
 
@@ -19,8 +24,14 @@ pub enum Event {
 pub enum GeneralError {
     #[error("usage: everlasting [torrent file | magnet link]")]
     Usage,
+    #[error("piece was already flushed or incomplete")]
+    AlreadyFlushed,
     #[error("file does not exist")]
     NonExistentFile,
+    #[error("oops")]
+    InvalidPieceIdx,
+    #[error("oops")]
+    InvalidPieceHash,
     #[error("magnet link contains no valid trackers: `{0:?}`")]
     InvalidUdpTracker(String),
     #[error("magnet link is invalid: `{0:?}`")]
@@ -71,22 +82,9 @@ impl TorrentInfo {
         let piece_len = self.info.piece_length;
         len / piece_len / 64 + 1
     }
-
-    pub fn file_layout(&self) -> Layout {
-        match &self.info.mode {
-            Mode::Single { name, .. } => (name, None),
-            Mode::Multi {
-                dir_name, files, ..
-            } => {
-                let files = files.iter().map(|f| f.path.as_slice()).collect();
-                (dir_name, Some(files))
-            }
-        }
-    }
 }
 
 // first value is either multi-mode directory or single mode file
-pub type Layout<'a> = (&'a str, Option<Vec<&'a [String]>>);
 
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Info {
@@ -102,12 +100,12 @@ pub enum Mode {
     Single {
         name: String,
         length: u64,
-        md5sum: Option<Vec<u8>>,
+        md5sum: Option<Box<[u8]>>,
     },
     Multi {
         dir_name: String,
         files: Vec<File>,
-        md5sum: Option<Vec<u8>>,
+        md5sum: Option<Box<[u8]>>,
     },
 }
 
@@ -121,10 +119,59 @@ impl Default for Mode {
     }
 }
 
+impl Mode {
+    pub fn create_file_layout(&self) -> Result<(), Report> {
+        use std::fs::File;
+
+        let full_path = Path::new("./downloads");
+        let x = fs::create_dir(full_path.clone());
+        debug!(?x);
+
+        match self {
+            Mode::Single { name, .. } => {
+                File::create(full_path.join(name))?;
+            }
+            Mode::Multi {
+                dir_name, files, ..
+            } => {
+                let mut result = Vec::with_capacity(files.len());
+                // create parent directory
+                let path = full_path.join(dir_name);
+                let x = fs::create_dir(path.clone());
+                debug!(?x);
+
+                for file in files {
+                    match file.path.len() {
+                        1 => {
+                            let path = path.join(file.path[0].clone());
+
+                            File::create(&path)?;
+                            result.push(path);
+                        }
+                        n => {
+                            let path = path.join(
+                                file.path[..n - 1]
+                                    .iter()
+                                    .fold(PathBuf::new(), |path, acc| path.join(acc)),
+                            );
+                            let x = fs::create_dir_all(path.clone());
+                            debug!(?x);
+
+                            File::create(path.join(file.path.last().unwrap()))?;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct File {
     pub length: u64,
-    pub md5sum: Option<Vec<u8>>,
+    pub md5sum: Option<Box<[u8]>>,
     pub path: Vec<String>,
 }
 

@@ -9,7 +9,6 @@ use bendy::{
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 
-use tracing::debug;
 use url::Url;
 
 use crate::{
@@ -206,8 +205,8 @@ impl FromBencode for Info {
                                             file.length = u64::decode_bencode_object(pair.1)?;
                                         }
                                         (b"md5sum", _) => {
-                                            file.md5sum =
-                                                Some(pair.1.try_into_bytes().unwrap().to_vec());
+                                            let v = pair.1.try_into_bytes()?;
+                                            file.md5sum = Some(v.to_vec().into());
                                         }
                                         (b"path", _) => {
                                             let mut path = pair.1.try_into_list()?;
@@ -220,7 +219,6 @@ impl FromBencode for Info {
                                     }
                                 }
 
-                                debug!(?file);
                                 files.push(file);
                             }
                         }
@@ -264,7 +262,8 @@ impl FromBencode for Info {
                             length = u64::decode_bencode_object(pair.1)?;
                         }
                         (b"md5sum", _) => {
-                            md5sum = Some(pair.1.try_into_bytes()?.to_vec());
+                            let v = pair.1.try_into_bytes()?;
+                            md5sum = Some(v.to_vec().into());
                         }
                         _ => {}
                     }

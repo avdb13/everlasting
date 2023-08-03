@@ -1,9 +1,8 @@
-
 use bendy::decoding::FromBencode;
 use color_eyre::Report;
 
-use futures_util::{FutureExt, TryFutureExt};
-use rand::{Rng};
+use futures_util::TryFutureExt;
+use rand::Rng;
 use std::{io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     net::UdpSocket,
@@ -89,8 +88,8 @@ impl HttpSession {
         }
     }
 
-    pub async fn run(self, torrent: TorrentInfo) {
-        let parameters = Parameters::from(&torrent);
+    pub async fn run(self, torrent: Arc<TorrentInfo>) {
+        let parameters = Parameters::from(torrent.clone());
 
         let resp = self.get(&parameters).await;
 
@@ -177,7 +176,11 @@ impl UdpSession {
         Err(e.into())
     }
 
-    pub async fn announce(&mut self, cid: i64, torrent: &TorrentInfo) -> Result<Response, Report> {
+    pub async fn announce(
+        &mut self,
+        cid: i64,
+        torrent: Arc<TorrentInfo>,
+    ) -> Result<Response, Report> {
         let peer_id = rand::thread_rng().gen::<[u8; 20]>();
         let key = rand::thread_rng().gen::<u32>();
         let info_hash = torrent.info.value;
@@ -199,10 +202,10 @@ impl UdpSession {
         timeout(Duration::from_secs(3), self.dispatch(packet)).await?
     }
 
-    pub async fn run(mut self, torrent: &TorrentInfo) -> Result<(), Report> {
+    pub async fn run(mut self, torrent: Arc<TorrentInfo>) -> Result<(), Report> {
         if let Response::Connect { cid, .. } = self.connect().await? {
             for _ in 0..4 {
-                match self.announce(cid, torrent).await? {
+                match self.announce(cid, torrent.clone()).await? {
                     Response::Connect { .. } => {
                         continue;
                     }
@@ -236,8 +239,8 @@ pub struct Parameters {
     pub extensions: Option<()>,
 }
 
-impl From<&TorrentInfo> for Parameters {
-    fn from(torrent: &TorrentInfo) -> Self {
+impl From<Arc<TorrentInfo>> for Parameters {
+    fn from(torrent: Arc<TorrentInfo>) -> Self {
         Parameters {
             info_hash: torrent.info.value,
             peer_id: *PEER_ID,

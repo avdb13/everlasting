@@ -34,7 +34,7 @@ use crate::{
     data::{Peer, Peers, TorrentInfo},
     framing::FrameReader,
     helpers::Timer,
-    piece_manager::{BitField, PieceManager},
+    piece_manager::BitField,
 };
 
 use crate::pwp::*;
@@ -47,10 +47,10 @@ pub struct Router {
 }
 
 impl Router {
-    pub fn new(torrent: TorrentInfo, peer_rx: Receiver<Peers>) -> Self {
+    pub fn new(torrent: Arc<TorrentInfo>, peer_rx: Receiver<Peers>) -> Self {
         Router {
             peer_rx,
-            torrent: Arc::new(torrent),
+            torrent,
             peers: HashMap::new(),
             bitfield: Vec::new(),
         }
@@ -63,8 +63,8 @@ impl Router {
         let handshake = Arc::new(Handshake::new(self.torrent.info.value));
         let (bitfield_tx, bitfield_rx) = mpsc::channel(100);
 
-        let manager = PieceManager::new(piece_len, pieces);
-        manager.listen(bitfield_rx);
+        // let manager = PieceManager::new(piece_len, pieces);
+        // manager.listen(bitfield_rx);
         // let buffer = Buffer::new(pieces, piece_len);
         // let writer = Writer::new(piece_rx, buffer, piece_map);
 
