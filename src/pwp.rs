@@ -1,6 +1,9 @@
 use std::{fmt, io::Cursor};
 
+use bendy::encoding::ToBencode;
+
 use crate::{
+    extensions::{self, Extension},
     framing::{ParseCheck, ParseError},
     PEER_ID,
 };
@@ -131,7 +134,7 @@ impl ParseCheck for Handshake {
 }
 
 #[repr(i8)]
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Message {
     Handshake(Handshake) = -1,
     Choke,
@@ -156,55 +159,33 @@ pub enum Message {
         length: usize,
     },
     Port(u16),
-    Extended = 20,
-}
-
-impl fmt::Debug for Message {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Handshake(_) => write!(f, "Handshake"),
-            Self::Choke => write!(f, "Choke"),
-            Self::Unchoke => write!(f, "Unchoke"),
-            Self::Interested => write!(f, "Interested"),
-            Self::Uninterested => write!(f, "Uninterested"),
-            Self::Have(_) => f.debug_tuple("Have").finish(),
-            Self::BitField(_) => f.debug_tuple("BitField").finish(),
-            Self::Request { .. } => f.debug_struct("Request").finish(),
-            Self::Piece { .. } => f.debug_struct("Piece").finish(),
-            Self::Cancel { .. } => f.debug_struct("Cancel").finish(),
-            Self::Port(_) => f.debug_tuple("Port").finish(),
-            Self::Extended => write!(f, "Extended"),
-        }
-    }
+    Extended(extensions::Message) = 20,
 }
 
 impl Request for Message {
     fn to_request(&self) -> Vec<u8> {
         use Message::*;
 
+        let len = |i: u32| i.to_be_bytes().as_slice();
+
         match self {
             Handshake(handshake) => handshake.to_request(),
-            Choke => [0, 0, 0, 1, 0].to_vec(),
-            Unchoke => [0, 0, 0, 1, 1].to_vec(),
-            Interested => [0, 0, 0, 1, 2].to_vec(),
-            Uninterested => [0, 0, 0, 1, 3].to_vec(),
-            Have(x) => [[0, 0, 0, 5, 4].as_slice(), &(*x as u32).to_be_bytes()].concat(),
+            Choke => [len(1), &[0u8]].concat(),
+            Unchoke => [len(1), &[1u8]].concat(),
+            Interested => [len(1), &[2u8]].concat(),
+            Uninterested => [len(1), &[3u8]].concat(),
+            Have(x) => [len(5), &[4u8], &(*x as u32).to_be_bytes()].concat(),
             BitField(v) => {
                 let v: Vec<_> = v.iter().flat_map(|v| v.to_be_bytes()).collect();
-                [
-                    &(v.len() as u32 * 8 + 1).to_be_bytes(),
-                    [5u8].as_slice(),
-                    v.as_slice(),
-                ]
-                .concat()
+                [len(v.len() as u32 * 8 + 1), &[5], &v].concat()
             }
             Request {
                 index,
                 begin,
                 length,
             } => [
-                &(13u32).to_be_bytes(),
-                [6u8].as_slice(),
+                len(13),
+                &[6u8],
                 &(*index as u32).to_be_bytes(),
                 &(*begin as u32).to_be_bytes(),
                 &(*length as u32).to_be_bytes(),
@@ -215,8 +196,8 @@ impl Request for Message {
                 begin,
                 block,
             } => [
-                &((9 + block.len()) as u32).to_be_bytes(),
-                [7u8].as_slice(),
+                len(9 + block.len() as u32),
+                &[7u8],
                 &(*index as u32).to_be_bytes(),
                 &(*begin as u32).to_be_bytes(),
                 block.as_slice(),
@@ -227,15 +208,18 @@ impl Request for Message {
                 begin,
                 length,
             } => [
-                &(13u32).to_be_bytes(),
-                [8u8].as_slice(),
+                len(13),
+                &[8u8],
                 &(*index as u32).to_be_bytes(),
                 &(*begin as u32).to_be_bytes(),
                 &(*length as u32).to_be_bytes(),
             ]
             .concat(),
-            Port(i) => [&(3u32).to_be_bytes(), [9u8].as_slice(), &i.to_be_bytes()].concat(),
-            Extended => todo!(),
+            Port(i) => [len(3), &[9u8], &i.to_be_bytes()].concat(),
+            Extended(ext_header) => {
+                let v = ext_header.to_bencode().unwrap();
+                [len(v.len() as u32 + 1), &[20u8], &v].concat()
+            }
         }
     }
 

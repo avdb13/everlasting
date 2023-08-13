@@ -145,7 +145,7 @@ impl Connection {
 
         let mut reader: FrameReader<Message> = FrameReader::from(reader.inner, reader.buffer);
         while let Some(frame) = reader.read_frame().await? {
-            debug!("received frame from [{}]: {:?}", peer_addr, frame);
+            debug!("received frame from [{}]", peer_addr);
 
             tx.send(frame).await?;
         }

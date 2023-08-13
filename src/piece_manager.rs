@@ -170,8 +170,16 @@ impl PiecesWrapper {
         }
     }
     pub async fn write(&mut self, index: usize, begin: usize, block: &[u8]) -> Result<(), Report> {
-        let piece = self.inner.get_mut(index).unwrap();
-        let inner = piece.inner.as_mut().map(|x| x as &mut [u8]).unwrap();
+        let piece = self
+            .inner
+            .get_mut(index)
+            .ok_or(GeneralError::InvalidPieceIdx)?;
+
+        let inner = piece
+            .inner
+            .as_mut()
+            .map(|x| x as &mut [u8])
+            .ok_or(GeneralError::InvalidPieceIdx)?;
         let mut piece = Cursor::new(inner);
 
         let _ = piece.seek(SeekFrom::Start(begin as u64));
