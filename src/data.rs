@@ -1,19 +1,21 @@
 use std::{
     fs,
-    net::SocketAddr,
+    net::{SocketAddr, ToSocketAddrs},
     path::{Path, PathBuf},
 };
 
 use color_eyre::Report;
 use thiserror::Error;
 use tracing::debug;
+use url::Url;
 
-use crate::udp::Response;
+use crate::{helpers, udp::Response};
 
 pub type SocketResponse = (Response, SocketAddr);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub enum Event {
+    #[default]
     None = 0,
     Completed,
     Started,
@@ -26,6 +28,8 @@ pub enum GeneralError {
     Usage,
     #[error("piece was already flushed or incomplete")]
     AlreadyFlushed,
+    #[error("info metadata not fetched yet")]
+    MissingInfo,
     #[error("file does not exist")]
     NonExistentFile,
     #[error("oops")]
@@ -57,34 +61,107 @@ pub const SHA1_LEN: usize = 20;
 pub struct Announce {
     pub udp: Vec<SocketAddr>,
     pub http: Vec<String>,
+    pub peers: Vec<SocketAddr>,
+}
+
+impl Announce {
+    pub fn push(&mut self, s: String) -> Result<(), Report> {
+        if s.starts_with("http") {
+            self.http.push(s.clone());
+        }
+
+        if s.starts_with("udp") {
+            let url = Url::parse(&s)?;
+            let host = url.host().unwrap();
+            let port = url.port().unwrap();
+
+            let mut addr = (host.to_string(), port).to_socket_addrs()?;
+            let ip = addr
+                .next()
+                .ok_or(GeneralError::InvalidUdpTracker(s.to_owned()))?;
+            self.udp.push(ip);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Default, Debug, PartialEq, Clone)]
 pub struct TorrentInfo {
-    pub info: Info,
+    pub info: Option<Info>,
     // no need for Vec<Vec<T>> as torrents rarely have only one tracker
     pub announce: Announce,
     pub created: Option<u64>,
     pub comment: String,
     pub author: Option<String>,
+    pub hash: [u8; 20],
 }
 
 impl TorrentInfo {
-    pub fn length(&self) -> u64 {
-        match &self.info.mode {
-            Mode::Single { length, .. } => length.to_owned(),
-            Mode::Multi { files, .. } => files.iter().map(|f| f.length).sum(),
+    pub fn length(&self) -> usize {
+        match self.info.as_ref().map(|info| info.mode.clone()) {
+            Some(Mode::Single { length, .. }) => length.to_owned() as usize,
+            Some(Mode::Multi { files, .. }) => files.iter().map(|f| f.length as usize).sum(),
+            None => 0usize,
         }
     }
 
-    pub fn bitfield_size(&self) -> u64 {
+    pub fn bitfield_size(&self) -> usize {
         let len = self.length();
-        let piece_len = self.info.piece_length;
+        let piece_len = self
+            .info
+            .as_ref()
+            .map(|info| info.piece_length.clone() as usize)
+            .unwrap();
+
         len / piece_len / 64 + 1
     }
 }
 
-// first value is either multi-mode directory or single mode file
+impl TryFrom<Url> for TorrentInfo {
+    type Error = Report;
+
+    fn try_from(url: Url) -> Result<Self, Self::Error> {
+        let pairs = url.query_pairs().into_owned();
+        let mut info = TorrentInfo::default();
+
+        // v1: magnet:?xt=urn:btih:<info-hash>&dn=<name>&tr=<tracker-url>&x.pe=<peer-address>
+        // v2: magnet:?xt=urn:btmh:<tagged-info-hash>&dn=<name>&tr=<tracker-url>&x.pe=<peer-address>
+
+        for pair in pairs {
+            match (pair.0.as_str(), pair.1) {
+                ("xt", s) => {
+                    let split: Vec<_> = s.split(':').collect();
+                    match split[1] {
+                        "btih" => {
+                            info.hash = helpers::decode(split[2]);
+                        }
+                        "btmh" => {
+                            todo!()
+                        }
+                        _ => return Err(GeneralError::InvalidMagnet(s).into()),
+                    }
+                }
+                ("tr", s) => {
+                    info.announce.push(s);
+                }
+                ("dn", s) => {
+                    info.comment = s;
+                }
+                ("x.pe", s) => {
+                    let s = s
+                        .to_socket_addrs()?
+                        .next()
+                        .ok_or(GeneralError::InvalidUdpTracker(s))?;
+                    info.announce.peers.push(s.to_owned());
+                }
+                _ => {}
+            }
+        }
+
+        Ok(info)
+    }
+}
 
 #[derive(Clone, Default, Debug, PartialEq)]
 pub struct Info {
@@ -165,6 +242,13 @@ impl Mode {
         }
 
         Ok(())
+    }
+
+    pub fn name(&self) -> String {
+        match self {
+            Mode::Single { name, .. } => name.to_owned(),
+            Mode::Multi { dir_name, .. } => dir_name.to_owned(),
+        }
     }
 }
 

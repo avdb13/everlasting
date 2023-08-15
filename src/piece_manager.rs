@@ -1,18 +1,18 @@
 use std::fs;
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
-use std::ops::{BitAnd, BitAndAssign, BitXor, Range};
-use std::path::{Path, PathBuf};
+use std::ops::{BitAndAssign, BitXor};
+use std::path::Path;
 use std::sync::Arc;
 
 use ahash::{HashMap, HashMapExt};
 use color_eyre::Report;
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
+use tokio::sync::mpsc::Receiver;
 use tokio::sync::RwLock;
-use tokio::sync::{mpsc::Receiver, watch};
 
-use crate::data::{GeneralError, Mode, TorrentInfo, SHA1_LEN};
+use crate::data::{GeneralError, Info, Mode, SHA1_LEN};
 use crate::BLOCK_SIZE;
 
 #[derive(Debug, Clone)]
@@ -72,9 +72,10 @@ pub struct DataManager {
 }
 
 impl DataManager {
-    pub fn new(torrent: Arc<TorrentInfo>) -> Self {
-        let pieces = torrent.info.pieces.len();
-        let piece_len = torrent.info.piece_length;
+    pub fn new(info: Info) -> Self {
+        let pieces = info.pieces.len();
+        let piece_len = info.piece_length;
+
         // amount of usizes we need to preserve the bitfield
         let v = vec![0usize, pieces / std::mem::size_of::<usize>() + 1];
         // let actual_pieces = Vec::with_capacity(pieces).into_boxed_slice();
@@ -82,7 +83,7 @@ impl DataManager {
         DataManager {
             bitfield_map: Arc::new(RwLock::new(HashMap::new())),
             rare_pieces: Arc::new(RwLock::new(BitField(v.into_boxed_slice()))),
-            pieces: PiecesWrapper::new(torrent),
+            pieces: PiecesWrapper::new(info),
             piece_len,
         }
     }
@@ -154,12 +155,12 @@ pub struct PiecesWrapper {
 }
 
 impl PiecesWrapper {
-    pub fn new(torrent: Arc<TorrentInfo>) -> Self {
-        let piece_len = torrent.info.piece_length;
-        let hashes = torrent.info.pieces.clone();
-        let mode = torrent.info.mode.clone();
+    pub fn new(info: Info) -> Self {
+        let piece_len = info.piece_length;
+        let hashes = info.pieces.clone();
+        let mode = info.mode.clone();
 
-        let blocks = (torrent.info.piece_length as usize) / *BLOCK_SIZE + 1;
+        let blocks = (info.piece_length as usize) / *BLOCK_SIZE + 1;
         let inner = vec![Piece::new(blocks); hashes.len()].into_boxed_slice();
 
         Self {
@@ -279,9 +280,11 @@ mod tests {
         let torrent = std::fs::read("/home/mikoto/everlasting/music.torrent")?;
         let torrent = TorrentInfo::from_bencode(&torrent).unwrap();
 
-        let piece_len = torrent.info.piece_length;
-        let pieces_len = torrent.info.pieces.len();
-        let files = if let Mode::Multi { files, .. } = torrent.info.mode {
+        let info = torrent.info.unwrap();
+        let piece_len = info.piece_length;
+        let pieces_len = info.pieces.len();
+
+        let files = if let Mode::Multi { files, .. } = info.mode {
             files
         } else {
             panic!();

@@ -1,8 +1,7 @@
 #![feature(vec_push_within_capacity)]
 #![feature(slice_take)]
 
-use std::sync::Arc;
-
+use ahash::HashSet;
 use bendy::decoding::FromBencode;
 use data::TorrentInfo;
 
@@ -12,7 +11,7 @@ use rand::Rng;
 
 use tracker::HttpTracker;
 
-use crate::peer::Router;
+use crate::tracker::UdpTracker;
 
 use color_eyre::Report;
 
@@ -24,22 +23,15 @@ pub mod data;
 pub mod dht;
 pub mod extensions;
 pub mod framing;
-pub mod fs;
 pub mod helpers;
 pub mod krpc;
-pub mod magnet;
-pub mod nameless;
 pub mod peer;
 pub mod piece_manager;
 pub mod pwp;
-pub mod scrape;
-pub mod socket;
-pub mod state;
 pub mod torrent;
 pub mod tracker;
 pub mod tracker_session;
 pub mod udp;
-// pub mod writer;
 
 lazy_static! {
     static ref BLOCK_SIZE: usize = 2 ^ 14;
@@ -58,6 +50,8 @@ lazy_static! {
     .as_bytes()
     .try_into()
     .unwrap();
+    static ref EXTENSION_MAP: HashSet<&'static str> =
+        HashSet::from_iter(["xv_metadata"].into_iter());
 }
 
 #[tokio::main]
@@ -76,15 +70,16 @@ async fn main() -> Result<(), Report> {
     dbg!("tracing_subscriber and color_eyre done setting up");
 
     let torrent = std::fs::read("/home/mikoto/everlasting/music.torrent")?;
-    let torrent_info = Arc::new(TorrentInfo::from_bencode(&torrent).unwrap());
+    let info = TorrentInfo::from_bencode(&torrent).unwrap();
 
-    panic!();
+    // if announce is empty we want to rely on the DHT to get a complete TorrentInfo
+    let (http, peer_rx) = HttpTracker::new(&info)?;
+    let (udp, peer_rx) = UdpTracker::new(&info)?;
+    tokio::spawn(http.run());
+    tokio::spawn(udp.run());
 
-    let (tracker, peer_rx) = HttpTracker::new(torrent_info);
-    tokio::spawn(tracker.run(torrent_info.clone()));
-
-    let router = Router::new(torrent_info.clone(), peer_rx);
-    router.run().await;
+    // let router = Router::new(, peer_rx);
+    // router.run().await;
 
     loop {}
 

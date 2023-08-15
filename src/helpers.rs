@@ -1,9 +1,11 @@
 use color_eyre::Report;
 use futures_util::Future;
 use std::{
+    net::ToSocketAddrs,
     thread::sleep,
     time::{self, Duration},
 };
+use url::Url;
 
 use crate::data::GeneralError;
 

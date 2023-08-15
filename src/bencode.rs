@@ -27,7 +27,9 @@ impl FromBencode for TorrentInfo {
         Self: Sized,
     {
         let mut dict = object.try_into_dictionary()?;
+
         let mut md = TorrentInfo::default();
+        let mut info = Info::default();
 
         while let Some(pair) = dict.next_pair()? {
             match pair {
@@ -41,26 +43,14 @@ impl FromBencode for TorrentInfo {
                         let hash = <[u8; 20]>::from_hex(hasher.result_str())?;
 
                         let mut dec = Decoder::new(bytes);
-                        let info = Info::decode_bencode_object(dec.next_object()?.unwrap())?;
+                        info = Info::decode_bencode_object(dec.next_object()?.unwrap())?;
 
-                        md.info = info;
-                        md.info.value = hash;
+                        md.hash = hash;
                     }
                 }
                 (b"announce", _) => {
                     let s = String::decode_bencode_object(pair.1)?;
-                    if s.starts_with("http") {
-                        md.announce.http.push(s.clone());
-                    }
-                    if s.starts_with("udp") {
-                        let url = Url::parse(&s)?;
-                        let host = url.host().unwrap();
-                        let port = url.port().unwrap();
-
-                        if let Ok(mut addr) = (host.to_string(), port).to_socket_addrs() {
-                            md.announce.udp.push(addr.next().unwrap());
-                        }
-                    }
+                    md.announce.push(s);
                 }
                 (b"announce-list", list) => {
                     // Not bothering separating announce and announce-list since they both contain
@@ -100,10 +90,9 @@ impl FromBencode for TorrentInfo {
                     let s = String::decode_bencode_object(pair.1)?;
                     md.author = Some(s);
                 }
-
                 (b"piece length", _) => {
                     let i = u64::decode_bencode_object(pair.1)?;
-                    md.info.piece_length = i;
+                    info.piece_length = i;
                 }
                 (b"pieces", _) => {
                     let pieces = pair.1.try_into_bytes()?;
@@ -112,7 +101,7 @@ impl FromBencode for TorrentInfo {
                         .map(|x| x[0..=20].try_into().unwrap())
                         .collect();
 
-                    md.info.pieces = pieces.into_boxed_slice();
+                    info.pieces = pieces.into_boxed_slice();
                 }
                 (b"nodes", _) => {
                     let mut list = pair.1.try_into_list()?;
@@ -132,6 +121,9 @@ impl FromBencode for TorrentInfo {
                 }
             }
         }
+
+        md.info = Some(info);
+
         Ok(md)
     }
 }

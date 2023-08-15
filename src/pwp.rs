@@ -1,11 +1,11 @@
 use std::{fmt, io::Cursor};
 
-use bendy::encoding::ToBencode;
+use bendy::{decoding::FromBencode, encoding::ToBencode};
 
 use crate::{
     extensions::{self, Extension},
     framing::{ParseCheck, ParseError},
-    PEER_ID,
+    EXTENSION_MAP, PEER_ID,
 };
 
 #[derive(Debug)]
@@ -17,8 +17,8 @@ pub struct State {
     pub dht_port: Option<u16>,
 }
 
-impl State {
-    pub fn new() -> Self {
+impl Default for State {
+    fn default() -> Self {
         Self {
             choked: true,
             interested: false,
@@ -63,6 +63,15 @@ impl Handshake {
             payload: None,
         }
     }
+
+    // pub fn extensions(&self) -> Option<()> {
+    //     if self.reserved[7] |= 0x04 {
+    //         println!("Fast Peers Extensions");
+    //     }
+    //     if self.reserved[7] |= 0x01 {
+    //         println!("");
+    //     }
+    // }
 }
 
 impl Request for Handshake {
@@ -82,7 +91,7 @@ impl Request for Handshake {
         let reserved = v[20..28].try_into().ok()?;
         let hash = v[28..48].try_into().ok()?;
         let peer_id = v[48..68].try_into().ok()?;
-        let payload = if v[68..].len() != 0 {
+        let payload = if !v[68..].is_empty() {
             Some(v[68..].to_vec())
         } else {
             None
@@ -166,25 +175,25 @@ impl Request for Message {
     fn to_request(&self) -> Vec<u8> {
         use Message::*;
 
-        let len = |i: u32| i.to_be_bytes().as_slice();
+        let len = |i: u32| i.to_be_bytes();
 
         match self {
             Handshake(handshake) => handshake.to_request(),
-            Choke => [len(1), &[0u8]].concat(),
-            Unchoke => [len(1), &[1u8]].concat(),
-            Interested => [len(1), &[2u8]].concat(),
-            Uninterested => [len(1), &[3u8]].concat(),
-            Have(x) => [len(5), &[4u8], &(*x as u32).to_be_bytes()].concat(),
+            Choke => [len(1).as_slice(), &[0u8]].concat(),
+            Unchoke => [len(1).as_slice(), &[1u8]].concat(),
+            Interested => [len(1).as_slice(), &[2u8]].concat(),
+            Uninterested => [len(1).as_slice(), &[3u8]].concat(),
+            Have(x) => [len(5).as_slice(), &[4u8], &(*x as u32).to_be_bytes()].concat(),
             BitField(v) => {
                 let v: Vec<_> = v.iter().flat_map(|v| v.to_be_bytes()).collect();
-                [len(v.len() as u32 * 8 + 1), &[5], &v].concat()
+                [len(v.len() as u32 * 8 + 1).as_slice(), &[5u8], &v].concat()
             }
             Request {
                 index,
                 begin,
                 length,
             } => [
-                len(13),
+                len(13).as_slice(),
                 &[6u8],
                 &(*index as u32).to_be_bytes(),
                 &(*begin as u32).to_be_bytes(),
@@ -196,7 +205,7 @@ impl Request for Message {
                 begin,
                 block,
             } => [
-                len(9 + block.len() as u32),
+                len(9 + block.len() as u32).as_slice(),
                 &[7u8],
                 &(*index as u32).to_be_bytes(),
                 &(*begin as u32).to_be_bytes(),
@@ -208,17 +217,32 @@ impl Request for Message {
                 begin,
                 length,
             } => [
-                len(13),
+                len(13).as_slice(),
                 &[8u8],
                 &(*index as u32).to_be_bytes(),
                 &(*begin as u32).to_be_bytes(),
                 &(*length as u32).to_be_bytes(),
             ]
             .concat(),
-            Port(i) => [len(3), &[9u8], &i.to_be_bytes()].concat(),
-            Extended(ext_header) => {
-                let v = ext_header.to_bencode().unwrap();
-                [len(v.len() as u32 + 1), &[20u8], &v].concat()
+            Port(i) => [len(3).as_slice(), &[9u8], &i.to_be_bytes()].concat(),
+            Extended(ext) => {
+                let v = ext.to_bencode().unwrap();
+                v
+
+                // match ext {
+                //     Message::Handshake(h) => {
+                //         [len(v.len() as u32 + 1).as_slice(), &[20u8], &v].concat()
+                //     }
+                //     Message::Extension(e) => match e {
+                //         Extension::None => {}
+                //         Extension::Metadata {
+                //             msg_type,
+                //             piece,
+                //             total_size,
+                //             payload,
+                //         } => {}
+                //     },
+                // }
             }
         }
     }
@@ -322,7 +346,16 @@ impl ParseCheck for Message {
 
                 Port(port)
             }
-            20 => Extended,
+            20 => {
+                // let i = EXTENSION_MAP
+                //     .iter()
+                //     .enumerate()
+                //     .find(|(i, _)| i as u8 == rem[0])
+                //     .unwrap_or(0);
+                let extended = extensions::Message::from_bencode(&rem[1..]).unwrap();
+
+                Extended(extended)
+            }
             _ => panic!(),
         };
 

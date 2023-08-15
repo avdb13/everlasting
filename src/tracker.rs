@@ -3,14 +3,15 @@ use color_eyre::Report;
 use std::net::Ipv4Addr;
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc, time::Duration};
 
+use std::net::UdpSocket as StdSocket;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::{mpsc, watch};
 use tokio::{net::UdpSocket, sync::mpsc::channel, task::JoinSet, time::timeout};
 use tracing::debug;
 
-use crate::data::Peers;
+use crate::data::{Peers, TorrentInfo};
 use crate::tracker_session::{HttpSession, Parameters, UdpSession};
-use crate::{data::TorrentInfo, udp::Response};
+use crate::udp::Response;
 
 type ChannelMap = (
     HashMap<SocketAddr, mpsc::Sender<Response>>,
@@ -20,15 +21,18 @@ type ChannelMap = (
 pub struct UdpTracker {
     pub socket: Arc<UdpSocket>,
     pub session_map: HashMap<SocketAddr, UdpSession>,
+    pub hash: [u8; 20],
+    pub length: usize,
 }
 
 impl UdpTracker {
-    pub async fn new(torrent: Arc<TorrentInfo>) -> Result<(Self, Receiver<Peers>), Report> {
-        let trackers = torrent.announce.udp.clone();
+    pub fn new(info: &TorrentInfo) -> Result<(Self, Receiver<Peers>), Report> {
+        let length = info.length();
+        let trackers = info.announce.udp.clone();
         let (peer_tx, peer_rx) = channel(100);
 
-        let src = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 1317u16));
-        let socket = Arc::new(UdpSocket::bind(src).await?);
+        let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, 1317u16));
+        let socket = Arc::new(UdpSocket::from_std(StdSocket::bind(addr)?)?);
 
         let map: Vec<_> = trackers
             .into_iter()
@@ -56,17 +60,18 @@ impl UdpTracker {
             Self {
                 session_map,
                 socket,
+                hash: info.hash,
+                length: info.length(),
             },
             peer_rx,
         ))
     }
 
-    pub async fn run(self, torrent: Arc<TorrentInfo>) -> Result<(), Report> {
+    pub async fn run(self) -> Result<(), Report> {
         let mut set = JoinSet::new();
 
         for (_, session) in self.session_map.into_iter() {
-            let torrent = torrent.clone();
-            set.spawn(async move { session.run(torrent).await });
+            set.spawn(async move { session.run(self.hash, self.length).await });
         }
 
         tokio::spawn(async move {
@@ -114,6 +119,7 @@ pub enum State {
 }
 
 pub struct HttpTracker {
+    pub parameters: Arc<Parameters>,
     pub trackers: Vec<HttpSession>,
 }
 
@@ -126,32 +132,37 @@ impl Parameters {
 // pub type WatchMap = HashMap<String, (watch::Sender<Parameters>, watch::Receiver<Parameters>)>;
 
 impl HttpTracker {
-    pub fn new(torrent: Arc<TorrentInfo>) -> (Self, mpsc::Receiver<Peers>) {
-        let trackers = &torrent.announce;
+    pub fn new(info: &TorrentInfo) -> Result<(Self, mpsc::Receiver<Peers>), Report> {
+        let trackers = info.announce.http.clone();
+        let parameters = Parameters::try_from(info)?;
 
         let (peer_tx, peer_rx): (mpsc::Sender<Peers>, mpsc::Receiver<Peers>) = mpsc::channel(100);
 
         let (_param_tx, param_rx): (watch::Sender<Parameters>, watch::Receiver<Parameters>) =
-            watch::channel(Parameters::from(torrent.clone()));
+            watch::channel(parameters.clone());
 
         debug!("trackers: {:?}", trackers);
-        let trackers: Vec<HttpSession> = trackers
+        let trackers: Vec<HttpSession> = info
+            .announce
             .http
             .iter()
             .flat_map(|s| HttpSession::connect(s.clone(), param_rx.clone(), peer_tx.clone()).ok())
             .collect();
 
-        (Self { trackers }, peer_rx)
+        Ok((
+            Self {
+                trackers,
+                parameters: Arc::new(parameters),
+            },
+            peer_rx,
+        ))
     }
 
-    pub async fn run(self, torrent: Arc<TorrentInfo>) -> Result<(), Report> {
+    pub async fn run(self) -> Result<(), Report> {
         let mut set = JoinSet::new();
 
         for session in self.trackers {
-            set.spawn({
-                let torrent = torrent.clone();
-                session.run(torrent)
-            });
+            set.spawn(session.run(self.parameters.clone()));
         }
 
         while let Some(resp) = set.join_next().await {

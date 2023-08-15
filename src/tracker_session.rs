@@ -88,9 +88,7 @@ impl HttpSession {
         }
     }
 
-    pub async fn run(self, torrent: Arc<TorrentInfo>) {
-        let parameters = Parameters::from(torrent.clone());
-
+    pub async fn run(self, parameters: Arc<Parameters>) {
         let resp = self.get(&parameters).await;
 
         if let Ok(resp) = resp {
@@ -179,11 +177,11 @@ impl UdpSession {
     pub async fn announce(
         &mut self,
         cid: i64,
-        torrent: Arc<TorrentInfo>,
+        info_hash: [u8; 20],
+        length: usize,
     ) -> Result<Response, Report> {
         let peer_id = rand::thread_rng().gen::<[u8; 20]>();
         let key = rand::thread_rng().gen::<u32>();
-        let info_hash = torrent.info.value;
 
         let packet = Request::Announce {
             cid,
@@ -191,7 +189,7 @@ impl UdpSession {
             tid: rand::thread_rng().gen::<i32>(),
             info_hash,
             peer_id,
-            up_down_left: (0, 0, torrent.length() as i64),
+            up_down_left: (0, 0, length),
             event: Event::None,
             socket: self.socket.local_addr().unwrap(),
             key,
@@ -202,10 +200,10 @@ impl UdpSession {
         timeout(Duration::from_secs(3), self.dispatch(packet)).await?
     }
 
-    pub async fn run(mut self, torrent: Arc<TorrentInfo>) -> Result<(), Report> {
+    pub async fn run(mut self, info_hash: [u8; 20], length: usize) -> Result<(), Report> {
         if let Response::Connect { cid, .. } = self.connect().await? {
             for _ in 0..4 {
-                match self.announce(cid, torrent.clone()).await? {
+                match self.announce(cid, info_hash, length).await? {
                     Response::Connect { .. } => {
                         continue;
                     }
@@ -223,11 +221,12 @@ impl UdpSession {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Parameters {
     pub info_hash: [u8; 20],
     pub peer_id: [u8; 20],
     pub port: u16,
-    pub up_down_left: (u64, u64, u64),
+    pub up_down_left: (usize, usize, usize),
     // some trackers only support compact responses
     pub compact: bool,
     pub no_peer_id: bool,
@@ -239,13 +238,15 @@ pub struct Parameters {
     pub extensions: Option<()>,
 }
 
-impl From<Arc<TorrentInfo>> for Parameters {
-    fn from(torrent: Arc<TorrentInfo>) -> Self {
-        Parameters {
-            info_hash: torrent.info.value,
+impl TryFrom<&TorrentInfo> for Parameters {
+    type Error = GeneralError;
+
+    fn try_from(info: &TorrentInfo) -> Result<Self, Self::Error> {
+        Ok(Parameters {
+            info_hash: info.hash,
             peer_id: *PEER_ID,
             port: *BITTORRENT_PORT,
-            up_down_left: (0, 0, torrent.length()),
+            up_down_left: (0, 0, info.length()),
             compact: false,
             no_peer_id: false,
             event: Event::None,
@@ -254,6 +255,6 @@ impl From<Arc<TorrentInfo>> for Parameters {
             key: None,
             tracker_id: None,
             extensions: None,
-        }
+        })
     }
 }

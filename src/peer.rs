@@ -32,6 +32,7 @@ use tracing::debug;
 
 use crate::{
     data::{Peer, Peers, TorrentInfo},
+    extensions,
     framing::FrameReader,
     helpers::Timer,
     piece_manager::BitField,
@@ -57,10 +58,7 @@ impl Router {
     }
 
     pub async fn run(mut self) {
-        let pieces = self.torrent.info.pieces.len();
-        let piece_len = self.torrent.info.piece_length as usize;
-
-        let handshake = Arc::new(Handshake::new(self.torrent.info.value));
+        let handshake = Arc::new(Handshake::new(self.torrent.hash));
         let (bitfield_tx, bitfield_rx) = mpsc::channel(100);
 
         // let manager = PieceManager::new(piece_len, pieces);
@@ -68,16 +66,27 @@ impl Router {
         // let buffer = Buffer::new(pieces, piece_len);
         // let writer = Writer::new(piece_rx, buffer, piece_map);
 
+        let (pieces, piece_len) = self
+            .torrent
+            .info
+            .as_ref()
+            .map(|info| (info.pieces.len(), info.piece_length))
+            .unwrap();
+
         while let Some(peers) = self.peer_rx.recv().await {
             for peer in peers.into_iter() {
                 let handshake = handshake.clone();
                 let bitfield_tx = bitfield_tx.clone();
 
-                tokio::spawn(async move {
+                let f = async move {
                     if let Ok(conn) = Connection::handshake(peer, handshake, pieces).await {
+                        // if self.torrent.info.is_none() {}
+
                         conn.handle(bitfield_tx).await;
                     }
-                });
+                };
+
+                tokio::spawn(f);
             }
         }
     }
@@ -100,7 +109,7 @@ impl Connection {
             frame_rx,
             real_len,
             buffer: BytesMut::new(),
-            state: Arc::new(RwLock::new(State::new())),
+            state: Arc::new(RwLock::new(State::default())),
         }
     }
 
@@ -138,10 +147,13 @@ impl Connection {
         if let Some(handshake) = reader.read_frame().await? {
             debug!("[{}] received the handshake ...", peer_addr);
 
+            handshake.reserved;
+
             if handshake.reserved[7] | 0x01 == 1 {
                 debug!("supports DHT: [{}]", peer_addr);
             }
         }
+        // let mut reader: FrameReader<extensions::Handshake> = FrameReader::new(r);
 
         let mut reader: FrameReader<Message> = FrameReader::from(reader.inner, reader.buffer);
         while let Some(frame) = reader.read_frame().await? {
@@ -155,16 +167,18 @@ impl Connection {
 
     pub async fn handle(mut self, bitfield_tx: Sender<(SocketAddr, BitField)>) {
         let dst = self.inner.peer_addr().unwrap();
+
+        // caching
         let mut have_buffer: Vec<usize> = Vec::with_capacity(64);
         let mut timer = Timer::new(Duration::from_secs(3));
 
         while let Some(message) = self.frame_rx.recv().await {
-            // cache have messages
             if let Message::Have(idx) = message {
                 timer.reset();
                 have_buffer.push(idx);
             }
 
+            // check if timer elapsed on all messages
             if timer.elapsed() {
                 let bitfield = BitField::from_lazy(have_buffer.clone(), self.real_len);
                 let _ = bitfield_tx.send((dst, bitfield)).await;
@@ -192,5 +206,9 @@ impl Connection {
             }
             drop(state);
         }
+    }
+
+    pub async fn get_metadata(&self) {
+        // self.inner
     }
 }

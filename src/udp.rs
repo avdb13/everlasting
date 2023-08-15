@@ -18,7 +18,7 @@ pub enum Request {
         tid: i32,
         info_hash: [u8; 20],
         peer_id: [u8; 20],
-        up_down_left: (i64, i64, i64),
+        up_down_left: (usize, usize, usize),
         event: Event,
         socket: SocketAddr,
         key: u32,
