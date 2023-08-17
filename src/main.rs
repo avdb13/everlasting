@@ -28,6 +28,7 @@ pub mod krpc;
 pub mod peer;
 pub mod piece_manager;
 pub mod pwp;
+pub mod sqlite;
 pub mod torrent;
 pub mod tracker;
 pub mod tracker_session;
@@ -56,7 +57,6 @@ lazy_static! {
 
 #[tokio::main]
 async fn main() -> Result<(), Report> {
-    dbg!("program started");
     color_eyre::install()?;
 
     tracing_subscriber::registry()

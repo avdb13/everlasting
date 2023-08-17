@@ -26,6 +26,8 @@ pub enum Event {
 pub enum GeneralError {
     #[error("usage: everlasting [torrent file | magnet link]")]
     Usage,
+    #[error("first bucket must contain our own node")]
+    UninitializedNode,
     #[error("piece was already flushed or incomplete")]
     AlreadyFlushed,
     #[error("info metadata not fetched yet")]
