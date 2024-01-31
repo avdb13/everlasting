@@ -1,6 +1,5 @@
 # Project has been resumed at (epifanio)[https://github.com/avdb13/epifanio]
 
-
 # Everlasting
 A concurrent bittorrent client that leverages XDP (Express Data Path) to ensure maximum throughput. Still not quite finished.
 
